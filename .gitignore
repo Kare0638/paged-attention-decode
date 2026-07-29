@@ -1,3 +1,6 @@
+# Local-only Chinese README — keep this out of the public repo
+README.zh-CN.md
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
