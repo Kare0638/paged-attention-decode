@@ -1,0 +1,67 @@
+{
+  "timestamp": "2026-07-30T11:09:39",
+  "shape": {
+    "num_kv_heads": 2,
+    "gqa_ratio": 6,
+    "head_dim": 128,
+    "page_size": 16,
+    "seq_len": 2048
+  },
+  "sweep": [
+    {
+      "batch": 1,
+      "seq_len": 2048,
+      "reference_ms": 0.6031,
+      "kernel_v1_ms": 0.3103,
+      "speedup": 1.94
+    },
+    {
+      "batch": 2,
+      "seq_len": 2048,
+      "reference_ms": 2.4976,
+      "kernel_v1_ms": 0.343,
+      "speedup": 7.28
+    },
+    {
+      "batch": 4,
+      "seq_len": 2048,
+      "reference_ms": 1.9671,
+      "kernel_v1_ms": 0.266,
+      "speedup": 7.39
+    },
+    {
+      "batch": 8,
+      "seq_len": 2048,
+      "reference_ms": 3.6854,
+      "kernel_v1_ms": 0.2601,
+      "speedup": 14.17
+    },
+    {
+      "batch": 16,
+      "seq_len": 2048,
+      "reference_ms": 7.2301,
+      "kernel_v1_ms": 0.2652,
+      "speedup": 27.26
+    },
+    {
+      "batch": 32,
+      "seq_len": 2048,
+      "reference_ms": 16.2468,
+      "kernel_v1_ms": 0.3461,
+      "speedup": 46.94
+    },
+    {
+      "batch": 64,
+      "seq_len": 2048,
+      "reference_ms": 29.0404,
+      "kernel_v1_ms": 0.5262,
+      "speedup": 55.18
+    }
+  ],
+  "gpu_name": "NVIDIA GeForce RTX 3060 Laptop GPU",
+  "driver_version": "610.74",
+  "power_draw_w": 90.93,
+  "power_limit_w": null,
+  "sm_clock_mhz": 1950.0,
+  "method": "cuda.Event timing, best-of-30 after 10 warmup iters. reference.py runs fp32 on GPU (per-batch Python loop); kernel_v1 runs fp16 (single fused kernel over the whole batch). Not a dtype-matched comparison \u2014 each implementation in its natural/enforced dtype."
+}

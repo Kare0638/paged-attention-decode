@@ -36,7 +36,7 @@ seq_lens:    [batch]
 ## Roadmap
 
 - [x] Correctness: fp32 PyTorch reference implementation
-- [ ] Triton v1: naive, paged KV indexing
+- [x] Triton v1: naive, paged KV indexing
 - [ ] Triton v2: coalesced KV access
 - [ ] Triton v3: single-pass online softmax
 - [ ] Triton v4: split-K along the sequence dimension
@@ -47,6 +47,26 @@ seq_lens:    [batch]
 - [ ] Nsight-driven optimization log with before/after profiles
 - [ ] Benchmark against FlashInfer (A100)
 - [ ] Roofline plot using measured (not nominal) peak bandwidth
+
+## Results
+
+**v1 (Triton, naive)** — GQA ratio 6, head_dim 128, page_size 16, seq_len 2048:
+
+- Correctness: 112 tests passing by default (81 reference-oracle + 31
+  kernel-vs-reference), plus a 2000-case reference fuzz sweep and a
+  100-case kernel fuzz sweep, both clean.
+- Latency vs. the naive per-batch reference loop: 1.9x at batch=1, up to
+  55.2x at batch=64 (`bench/results/decode_latency_v1.json`) — this beats
+  a naive Python loop, it is not yet a claim of beating a strong baseline;
+  that comparison (vs. FlashInfer) is Week 6's job.
+- NCU at batch=1 (the realistic single-request decode case): grid is
+  `(1, 2, 1)` — only 2 thread blocks on a ~28-SM GPU, 8.33% occupancy,
+  `long_scoreboard` (memory-wait) is the dominant stall reason. At
+  batch=64 the *same* kernel hits 95.14% of peak DRAM bandwidth, showing
+  batch=1's low numbers are a parallelism problem specific to low-batch
+  decode, not a general kernel inefficiency — the direct, measured
+  motivation for v4's split-K. Full writeup in
+  [profiles/notes.md](profiles/notes.md).
 
 ## Repo layout
 
@@ -65,17 +85,19 @@ RTX 3060 Laptop (6GB) on WSL2 for development; cross-hardware validation planned
 
 ## Reproduce
 
-Kernel benchmarks are not yet available — kernels aren't implemented. The fp32 PyTorch reference correctness suite can be reproduced with:
-
 ```bash
 uv venv --python 3.12
 uv pip install -r requirements.txt
-uv run pytest tests/ -q
-# full 2000-case fuzz sweep (default is a fast 50-case subset):
-PAGED_ATTN_FUZZ_ITERS=2000 uv run pytest tests/test_reference_fuzz.py -q
-```
 
-Once `src/kernel_v1_naive.py` lands, this section will include the one-line kernel benchmark command.
+# correctness (reference oracle + Triton v1 kernel, needs a CUDA GPU for the kernel half)
+uv run pytest tests/ -q
+# full 2000-case reference fuzz / 100-case kernel fuzz (defaults are fast subsets):
+PAGED_ATTN_FUZZ_ITERS=2000 uv run pytest tests/test_reference_fuzz.py -q
+PAGED_ATTN_KERNEL_FUZZ_ITERS=100 uv run pytest tests/test_kernel_v1.py::test_fuzz_curated_shape_matrix -q
+
+# latency: reference vs. Triton v1, batch sweep at the primary target shape
+uv run python bench/bench_decode.py
+```
 
 ## License
 
