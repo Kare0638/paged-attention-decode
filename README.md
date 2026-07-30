@@ -1,6 +1,6 @@
 # Paged Attention Decode Kernel
 
-Decode-phase attention kernel for LLM inference with paged KV cache and GQA support — implemented from scratch in **Triton** and **CUDA C++**, optimized against Nsight Compute profiling data on a low-SM consumer GPU.
+Decode-phase attention kernel for LLM inference with paged KV cache and GQA support — being implemented from scratch in **Triton** and **CUDA C++**, optimized against Nsight Compute profiling data on a low-SM consumer GPU.
 
 ## Status
 
@@ -65,7 +65,15 @@ RTX 3060 Laptop (6GB) on WSL2 for development; cross-hardware validation planned
 
 ## Reproduce
 
-Not yet available — kernels aren't implemented. This section will hold the one-line repro command once `src/kernel_v1_naive.py` lands.
+Kernel benchmarks are not yet available — kernels aren't implemented. The current fp32 PyTorch reference smoke test can be reproduced with:
+
+```bash
+uv venv --python 3.12
+uv pip install -r requirements.txt
+uv run pytest tests/test_reference.py -q
+```
+
+Once `src/kernel_v1_naive.py` lands, this section will include the one-line kernel benchmark command.
 
 ## License
 
