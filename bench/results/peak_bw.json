@@ -1,0 +1,33 @@
+{
+  "timestamp": "2026-07-30T10:23:25",
+  "measured_peak_bandwidth_gb_s": 313.94,
+  "peak_at_buffer_mb": 256,
+  "sweep": [
+    {
+      "buffer_mb": 64,
+      "bandwidth_gb_s": 311.54
+    },
+    {
+      "buffer_mb": 128,
+      "bandwidth_gb_s": 312.82
+    },
+    {
+      "buffer_mb": 256,
+      "bandwidth_gb_s": 313.94
+    },
+    {
+      "buffer_mb": 512,
+      "bandwidth_gb_s": 313.76
+    },
+    {
+      "buffer_mb": 1024,
+      "bandwidth_gb_s": 313.8
+    }
+  ],
+  "gpu_name": "NVIDIA GeForce RTX 3060 Laptop GPU",
+  "driver_version": "610.74",
+  "power_draw_w": 91.21,
+  "power_limit_w": null,
+  "sm_clock_mhz": 1942.0,
+  "method": "D2D torch.Tensor.copy_, best-of-50 via cuda.Event timing, bandwidth = 2*bytes/time (read+write)"
+}
