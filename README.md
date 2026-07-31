@@ -38,12 +38,12 @@ seq_lens:    [batch]
 - [x] Correctness: fp32 PyTorch reference implementation
 - [x] Triton v1: naive, paged KV indexing
 - [x] Triton v2: wider tiles (decoupled from page_size) — see Results below; not a strict win over v1
-- [x] Triton v3: single-pass online softmax — already true of v1/v2's design (the running-softmax loop is structurally required at real seq_len, not a separate feature); the only untried part of this item, `num_stages` tuning, gave a real but modest gain (~11% at best) and isn't worth a dedicated kernel file — see [profiles/notes.md](profiles/notes.md). Investigating this surfaced a bigger, unrelated finding: both wrappers had an `assert` on a GPU tensor's value that forced a device-to-host sync, costing 2-3x the raw kernel latency at batch=1 — fixed, and every latency number below reflects the fix.
+- [x] Triton v3: single-pass online softmax — already true of v1/v2's design (the running-softmax loop is structurally required at real seq_len, not a separate feature). `src/kernel_v3_online_softmax.py` formalizes the one thing left to try, an explicit `num_stages=4` pin, but a real A/B through the wrapper shows it within noise of v2's Triton-auto-selected default at 6 of 7 batch sizes — reported as "checked, mostly already covered," not inflated into a claimed win. Investigating it surfaced a bigger, unrelated finding: both v1/v2's wrappers had an `assert` on a GPU tensor's value that forced a device-to-host sync, costing 2-3x the raw kernel latency at batch=1 — fixed, and every latency number below reflects the fix.
 - [ ] Triton v4: split-K along the sequence dimension
 - [ ] CUDA C++: explicit shared-memory tiling, bank-conflict elimination
 - [ ] CUDA C++: warp-shuffle reduction, occupancy analysis
 - [ ] CUDA C++: split-K, packaged as a PyTorch extension
-- [x] Correctness test suite for the reference implementation (page boundaries, extreme/ragged/zero-length sequences, non-contiguous block tables with unreferenced "holes", GQA ratios 1/4/6/8, full input-validation coverage, 2000-case randomized fuzz vs. an independently-written SDPA oracle) plus kernel-vs-reference suites for v1 and v2 (127 cases at default settings, `tests/`). Cross-implementation (Triton vs. CUDA) tests land once the CUDA version exists.
+- [x] Correctness test suite for the reference implementation (page boundaries, extreme/ragged/zero-length sequences, non-contiguous block tables with unreferenced "holes", GQA ratios 1/4/6/8, full input-validation coverage, 2000-case randomized fuzz vs. an independently-written SDPA oracle) plus kernel-vs-reference suites for v1, v2, and v3 (139 cases at default settings, `tests/`). Cross-implementation (Triton vs. CUDA) tests land once the CUDA version exists.
 - [ ] Nsight-driven optimization log with before/after profiles
 - [ ] Benchmark against FlashInfer (A100)
 - [ ] Roofline plot using measured (not nominal) peak bandwidth
@@ -113,6 +113,19 @@ this one assert: any check on a GPU tensor's *value* (not just its
 shape/dtype/device) is a sync point, and at sub-millisecond kernel
 latencies that sync can dominate the number being measured.
 
+**v3 (Triton, num_stages pinned)** — same kernel body and tile size as
+v2, `num_stages=4` explicit instead of Triton's auto-selected default. A
+real A/B through the wrapper (v3 vs. v2, same shape) landed within noise
+at 6 of 7 batch sizes (0.98x-1.00x, one outlier of 1.35x at batch=8 that
+doesn't repeat at neighboring batches) — Triton's own default for this
+tile size was apparently already close to 4, the same conclusion the
+`num_warps` sweep reached before v2 existed. Reported honestly as a
+lever that was checked and mostly already covered, not as a win. Of the
+levers tried so far, only v1->v2's tile-size change had a real,
+consistent, mechanistically-understood effect; the next one with an
+a priori large effect is v4's split-K — batch=1 is still capped at 2
+thread blocks on a ~28-SM GPU no matter how any of v1/v2/v3 are tuned.
+
 ## Repo layout
 
 ```
@@ -134,13 +147,13 @@ RTX 3060 Laptop (6GB) on WSL2 for development; cross-hardware validation planned
 uv venv --python 3.12
 uv pip install -r requirements.txt
 
-# correctness (reference oracle + Triton v1/v2 kernels, needs a CUDA GPU for the kernel half)
+# correctness (reference oracle + Triton v1/v2/v3 kernels, needs a CUDA GPU for the kernel half)
 uv run pytest tests/ -q
 # full 2000-case reference fuzz / 100-case kernel fuzz (defaults are fast subsets):
 PAGED_ATTN_FUZZ_ITERS=2000 uv run pytest tests/test_reference_fuzz.py -q
 PAGED_ATTN_KERNEL_FUZZ_ITERS=100 uv run pytest tests/test_kernel_v1.py::test_fuzz_curated_shape_matrix -q
 
-# latency: reference vs. Triton v1 vs. v2, batch sweep at the primary target shape
+# latency: reference vs. Triton v1 vs. v2 vs. v3, batch sweep at the primary target shape
 uv run python bench/bench_decode.py
 ```
 

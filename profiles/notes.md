@@ -278,3 +278,48 @@ reference loop went from 55.6x to 68.9x. The lesson generalizes past this
 one assert: any `assert`/`if` on a GPU tensor's *value* (not just its
 shape/dtype/device) is a synchronization point, and at sub-millisecond
 kernel latencies that sync can dominate the number being measured.
+
+## Triton v3 — num_stages formalized, and it doesn't beat Triton's own default (2026-07-30)
+
+`src/kernel_v3_online_softmax.py` reuses v1's kernel body (same as v2),
+block_n=128 (same as v2's default), plus an explicit `num_stages=4`
+instead of leaving it at whatever Triton auto-selects. Written up as a
+real file — matching the repo layout's documented naming — even though
+the roadmap's v3 description (single-pass online softmax, no
+intermediate materialization) was already satisfied by v1/v2's design
+before this file existed; the only new thing here is the num_stages pin.
+
+**Real A/B through the full wrapper** (`bench/bench_decode.py`, v3 vs v2,
+both fp16, same shape):
+
+| batch | v2 | v3 | v3 vs v2 |
+|---|---|---|---|
+| 1 | 0.0584 ms | 0.0584 ms | 1.00x |
+| 2 | 0.1331 ms | 0.1352 ms | 0.98x |
+| 4 | 0.0891 ms | 0.0891 ms | 1.00x |
+| 8 | 0.0942 ms | 0.0696 ms | **1.35x** |
+| 16 | 0.1546 ms | 0.1751 ms | 0.88x |
+| 32 | 0.2437 ms | 0.2477 ms | 0.98x |
+| 64 | 0.4390 ms | 0.4393 ms | 1.00x |
+
+Within noise for 6 of 7 batch sizes, one real win at batch=8 that doesn't
+repeat at neighboring batch sizes. This does *not* contradict the earlier
+num_stages sweep (which showed a clear 1->4 improvement on the raw kernel
+body) — that sweep's num_stages=1 was a forced low baseline for
+comparison, not what v2 was actually running. v2 never sets num_stages;
+it uses Triton's auto-selected default, which for this tile size was
+apparently already close to 4. Same conclusion the num_warps sweep
+reached before v2 was written: Triton's own heuristics for this kernel
+are already close to what a manual sweep finds, and the honest report is
+"checked, mostly already covered" rather than inflating a noise-level
+result into a claimed win.
+
+**Where the real wins came from, in order**: v1->v2's BLOCK_N change
+(up to 2.15x on the raw kernel, 1.21x-2.55x through the wrapper depending
+on batch) is the only Triton-level lever in this project so far with a
+consistent, mechanistically-understood effect (fewer dependent
+`block_table` loads, traded against occupancy at high batch). Both
+`num_warps` and `num_stages` tuning were checked and found to add little
+on top of Triton's defaults. The next lever with an *a priori* large,
+well-understood effect is v4's split-K — batch=1 is still capped at 2
+thread blocks on a ~28-SM GPU regardless of any of the tuning done so far.

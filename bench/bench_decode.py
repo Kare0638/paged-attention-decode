@@ -1,6 +1,6 @@
-"""Latency: fp32 reference (per-batch Python loop) vs. Triton v1 vs. v2.
+"""Latency: fp32 reference (per-batch Python loop) vs. Triton v1/v2/v3.
 
-All three run on GPU so the comparison isolates "one fused kernel over the
+All four run on GPU so the comparison isolates "one fused kernel over the
 whole batch" vs. "a Python loop issuing many small per-sequence GPU
 launches" — not a CPU-vs-GPU comparison. Each implementation runs in its
 own natural dtype (reference.py is fp32-only by design; the kernels are
@@ -27,6 +27,7 @@ import torch
 from measure_peak_bw import _gpu_power_state  # same dir as this script; reuse the metadata helper
 from src.kernel_v1_naive import paged_attention_decode_v1
 from src.kernel_v2_coalesced import paged_attention_decode_v2
+from src.kernel_v3_online_softmax import paged_attention_decode_v3
 from src.reference import paged_attention_decode_reference
 
 NUM_KV_HEADS = 2
@@ -98,6 +99,9 @@ def main() -> None:
         v2_ms = _time_cuda(
             lambda: paged_attention_decode_v2(q_fp16, k_fp16, v_fp16, bt_cuda, sl_cuda)
         )
+        v3_ms = _time_cuda(
+            lambda: paged_attention_decode_v3(q_fp16, k_fp16, v_fp16, bt_cuda, sl_cuda)
+        )
 
         results.append(
             {
@@ -106,14 +110,18 @@ def main() -> None:
                 "reference_ms": round(ref_ms, 4),
                 "kernel_v1_ms": round(v1_ms, 4),
                 "kernel_v2_ms": round(v2_ms, 4),
+                "kernel_v3_ms": round(v3_ms, 4),
                 "v1_speedup_vs_reference": round(ref_ms / v1_ms, 2),
                 "v2_speedup_vs_reference": round(ref_ms / v2_ms, 2),
+                "v3_speedup_vs_reference": round(ref_ms / v3_ms, 2),
                 "v2_speedup_vs_v1": round(v1_ms / v2_ms, 2),
+                "v3_speedup_vs_v2": round(v2_ms / v3_ms, 2),
             }
         )
         print(
             f"batch={batch:3d}: reference {ref_ms:9.4f} ms | v1 {v1_ms:8.4f} ms | "
-            f"v2 {v2_ms:8.4f} ms | v2 vs v1 {v1_ms / v2_ms:5.2f}x | v2 vs reference {ref_ms / v2_ms:6.1f}x"
+            f"v2 {v2_ms:8.4f} ms | v3 {v3_ms:8.4f} ms | v3 vs v2 {v2_ms / v3_ms:5.2f}x | "
+            f"v3 vs reference {ref_ms / v3_ms:6.1f}x"
         )
 
     record = {
@@ -130,8 +138,9 @@ def main() -> None:
         "method": "cuda.Event timing, best-of-30 after 10 warmup iters. reference.py "
         "runs fp32 on GPU (per-batch Python loop); kernels run fp16 (single fused "
         "kernel over the whole batch). Not a dtype-matched comparison — each "
-        "implementation in its natural/enforced dtype. v2 uses its default "
-        "block_n=128 (v1 has no block_n knob; its tile is fixed to page_size).",
+        "implementation in its natural/enforced dtype. v2/v3 use their default "
+        "block_n=128 (v1 has no block_n knob; its tile is fixed to page_size); "
+        "v3 additionally pins num_stages=4 instead of Triton's auto-selected default.",
     }
 
     out_path = Path(__file__).parent / "results" / "decode_latency.json"
