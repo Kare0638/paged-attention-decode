@@ -127,19 +127,21 @@ def paged_attention_decode_v1(
     input — it's a benchmark-facing kernel, not a public safety API. It
     asserts only the properties that would otherwise produce silently-wrong
     numbers rather than an obvious crash: dtype, device, GQA divisibility,
-    page_size (tl.dot's K-dimension floor is a hard >=16, unlike M/N which
-    Triton pads internally — verified empirically, not assumed), and
-    seq_len >= 1 (decode always attends to at least the current token;
-    seq_len == 0 is a reference-oracle-only synthetic case, not a real
-    workload, so it's out of scope here rather than specially handled).
+    and page_size (tl.dot's K-dimension floor is a hard >=16, unlike M/N
+    which Triton pads internally — verified empirically, not assumed).
+
+    seq_len >= 1 is a precondition (decode always attends to at least the
+    current token; seq_len == 0 is a reference-oracle-only synthetic case),
+    documented but deliberately NOT asserted here: `torch.all(seq_lens >=
+    1)` forces a device-to-host sync to evaluate as a Python bool, measured
+    at ~0.09-0.11ms — 2-3x the raw kernel launch time at batch=1 (0.057ms).
+    That's a real cost on every call for a check the test suite already
+    exercises during development; caught there instead of paying for it on
+    every production call.
     """
     assert q.is_cuda and k_cache.is_cuda and v_cache.is_cuda, "kernel_v1_naive requires CUDA tensors"
     assert q.dtype == torch.float16 and k_cache.dtype == torch.float16 and v_cache.dtype == torch.float16, (
         "kernel_v1_naive expects fp16 q/k_cache/v_cache"
-    )
-    assert torch.all(seq_lens >= 1), (
-        "kernel_v1_naive requires seq_len >= 1 for every sequence "
-        "(seq_len == 0 is only meaningful for the reference oracle's test coverage)"
     )
 
     batch, num_q_heads, head_dim = q.shape

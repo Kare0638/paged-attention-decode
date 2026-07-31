@@ -53,18 +53,17 @@ def paged_attention_decode_v2(
     block_n: int = 128,
 ) -> torch.Tensor:
     """Same contract as paged_attention_decode_v1 (see its docstring for the
-    non-exhaustive-validation rationale). block_n defaults to 128, the
-    largest tile size that fit this GPU's shared memory at the primary
-    target shape (head_dim=128) — pass a smaller power of 2 (>=16) for
-    configs where 128 doesn't fit.
+    non-exhaustive-validation rationale, and for why seq_len >= 1 is a
+    documented precondition rather than a runtime-asserted one — the
+    `torch.all(...)` device-to-host sync it requires cost 2-3x the raw
+    kernel launch time at batch=1, measured, not assumed). block_n
+    defaults to 128, the largest tile size that fit this GPU's shared
+    memory at the primary target shape (head_dim=128) — pass a smaller
+    power of 2 (>=16) for configs where 128 doesn't fit.
     """
     assert q.is_cuda and k_cache.is_cuda and v_cache.is_cuda, "kernel_v2_coalesced requires CUDA tensors"
     assert q.dtype == torch.float16 and k_cache.dtype == torch.float16 and v_cache.dtype == torch.float16, (
         "kernel_v2_coalesced expects fp16 q/k_cache/v_cache"
-    )
-    assert torch.all(seq_lens >= 1), (
-        "kernel_v2_coalesced requires seq_len >= 1 for every sequence "
-        "(seq_len == 0 is only meaningful for the reference oracle's test coverage)"
     )
 
     batch, num_q_heads, head_dim = q.shape

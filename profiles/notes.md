@@ -156,7 +156,10 @@ tiles mean fewer iterations, amortizing that dependent-load chain over
 more data per lookup.
 
 **Latency** (`bench/bench_decode.py`, v2 vs. v1, same shape, cuda-event
-best-of-30):
+best-of-30). Superseded once below — see "wrapper dispatch overhead" —
+but the crossover shape (v2 wins low batch, loses high batch) is the same
+story either way, since NCU's occupancy numbers below are unaffected by
+Python-side overhead:
 
 | batch | v1 | v2 | v2 vs v1 |
 |---|---|---|---|
@@ -170,8 +173,7 @@ best-of-30):
 
 This is not a clean win — it's a crossover, and the honest thing is to
 report both sides rather than only the batches where v2 looks good. v2 is
-faster at low batch (up to 1.51x at batch=4) and *slower* than v1 at
-batch=32/64. NCU explains why:
+faster at low batch and *slower* than v1 at batch=32/64. NCU explains why:
 
 | metric | v1, batch=1 | v2, batch=1 | v1, batch=64 | v2, batch=64 |
 |---|---|---|---|---|
@@ -202,3 +204,77 @@ a strict improvement over v1 and shouldn't be presented as one; the
 roadmap's original "v2 = coalesced KV access, unconditionally faster"
 framing doesn't survive contact with the data, and the batch=32/64
 regression is the more interesting finding of the two.
+
+## v3 investigation: num_stages sweep, and a bigger find in the wrapper (2026-07-30)
+
+The roadmap's v3 item is "single-pass online softmax, don't materialize
+the intermediate attention matrix, tune num_stages." The first two are
+already true of v1/v2's design (the loop's running `m_i`/`l_i`/`acc`
+update is structurally required at real seq_len, not something added
+later — see `kernel_v1_naive.py`'s docstring), so the only untried lever
+was `num_stages`, which both wrappers pinned to Triton's default so far.
+
+**`num_stages` sweep** (same v1 kernel body, launched directly, bypassing
+both wrappers):
+
+| config | batch | num_stages=1 | 2 | 3 | 4 | 5 | 6 |
+|---|---|---|---|---|---|---|---|
+| BLOCK_N=16 (v1) | 1 | 0.168 | 0.124 | 0.124 | 0.121 | **0.111** | 0.113 |
+| BLOCK_N=16 (v1) | 64 | 0.422 | 0.423 | 0.421 | 0.420 | 0.421 | 0.421 |
+| BLOCK_N=128 (v2) | 1 | 0.059 | **0.047** | 0.052 | 0.047 | OOM | OOM |
+| BLOCK_N=128 (v2) | 64 | 0.456 | 0.440 | 0.438 | **0.438** | OOM | OOM |
+
+Real but modest: ~11% at v1/batch=1 (num_stages=5 vs. Triton's default of
+3), a few percent for v2, nothing at batch=64 (already occupancy-bound,
+nothing left to hide). v2 hits the same shared-memory ceiling at
+num_stages>=5 that BLOCK_N=256 hit earlier (`OutOfResources`, wider tiles
+and deeper pipelining both spend the same limited budget). Not dramatic
+enough to justify a dedicated v3 kernel file — this is a launch-config
+tweak on the existing body, same as v2's BLOCK_N change, and small enough
+that it isn't folded into either wrapper's defaults for now.
+
+**The bigger find**: cross-checking a raw kernel launch (bypassing both
+wrappers) against `paged_attention_decode_v2()`'s full call at batch=1
+showed a gap far too large to be noise — 0.055ms raw vs. 0.148ms through
+the wrapper. Isolated by adding wrapper steps back one at a time:
+
+| step | latency |
+|---|---|
+| raw kernel launch | 0.057 ms |
+| + `block_table`/`seq_lens` `.to(torch.int32)` | 0.057-0.058 ms (no real cost) |
+| + `assert torch.all(seq_lens >= 1)` | **0.146-0.170 ms** |
+
+The `assert` — added deliberately in v1 to catch a real silently-wrong-answer
+risk (seq_len=0 divides by zero) — forces a device-to-host sync: `torch.all(...)`
+returns a CUDA tensor, and Python's `assert` needs its `__bool__()`, which
+blocks until the GPU finishes and a scalar comes back. That sync cost
+2-3x the raw kernel time at batch=1, on every call, confirmed reproducible
+across 3 independent runs. Fixed by removing the runtime check from both
+`kernel_v1_naive.py` and `kernel_v2_coalesced.py` — the precondition is
+still documented in both docstrings, and it's exercised by the test suite
+during development instead of paid for on every production call. Every
+prior latency number in this file and both READMEs used the un-fixed
+wrappers; the NCU occupancy numbers above are unaffected (they measure
+GPU execution, not Python dispatch), but the latency tables have been
+re-measured and corrected.
+
+**Corrected latency** (`bench/bench_decode.py`, post-fix):
+
+| batch | reference | v1 | v2 | v2 vs v1 | v2 vs reference |
+|---|---|---|---|---|---|
+| 1 | 0.693 ms | 0.123 ms | 0.078 ms | **1.58x** | **8.9x** |
+| 2 | 1.248 ms | 0.186 ms | 0.060 ms | **3.08x** | **20.7x** |
+| 4 | 1.952 ms | 0.146 ms | 0.065 ms | **2.27x** | **30.3x** |
+| 8 | 3.926 ms | 0.180 ms | 0.071 ms | **2.55x** | **55.6x** |
+| 16 | 7.549 ms | 0.143 ms | 0.158 ms | 0.91x | 47.9x |
+| 32 | 15.250 ms | 0.220 ms | 0.249 ms | 0.88x | 61.3x |
+| 64 | 30.542 ms | 0.419 ms | 0.443 ms | 0.94x | 68.9x |
+
+Same crossover shape as before (v2 wins low batch, loses batch>=16) — the
+mechanism (shared-memory-limited occupancy) doesn't change, only the
+absolute numbers do, and by a lot: v1/v2 both got substantially faster
+once the sync left the hot path, and v2's peak advantage over the naive
+reference loop went from 55.6x to 68.9x. The lesson generalizes past this
+one assert: any `assert`/`if` on a GPU tensor's *value* (not just its
+shape/dtype/device) is a synchronization point, and at sub-millisecond
+kernel latencies that sync can dominate the number being measured.

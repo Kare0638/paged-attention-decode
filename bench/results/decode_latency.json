@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-07-31T10:38:07",
+  "timestamp": "2026-07-31T11:24:06",
   "shape": {
     "num_kv_heads": 2,
     "gqa_ratio": 6,
@@ -11,77 +11,77 @@
     {
       "batch": 1,
       "seq_len": 2048,
-      "reference_ms": 0.6666,
-      "kernel_v1_ms": 0.3348,
-      "kernel_v2_ms": 0.2775,
-      "v1_speedup_vs_reference": 1.99,
-      "v2_speedup_vs_reference": 2.4,
-      "v2_speedup_vs_v1": 1.21
+      "reference_ms": 0.6932,
+      "kernel_v1_ms": 0.1229,
+      "kernel_v2_ms": 0.0778,
+      "v1_speedup_vs_reference": 5.64,
+      "v2_speedup_vs_reference": 8.91,
+      "v2_speedup_vs_v1": 1.58
     },
     {
       "batch": 2,
       "seq_len": 2048,
-      "reference_ms": 0.9923,
-      "kernel_v1_ms": 0.2508,
-      "kernel_v2_ms": 0.1718,
-      "v1_speedup_vs_reference": 3.96,
-      "v2_speedup_vs_reference": 5.78,
-      "v2_speedup_vs_v1": 1.46
+      "reference_ms": 1.2483,
+      "kernel_v1_ms": 0.1864,
+      "kernel_v2_ms": 0.0604,
+      "v1_speedup_vs_reference": 6.7,
+      "v2_speedup_vs_reference": 20.66,
+      "v2_speedup_vs_v1": 3.08
     },
     {
       "batch": 4,
       "seq_len": 2048,
-      "reference_ms": 1.9251,
-      "kernel_v1_ms": 0.2488,
-      "kernel_v2_ms": 0.1649,
-      "v1_speedup_vs_reference": 7.74,
-      "v2_speedup_vs_reference": 11.68,
-      "v2_speedup_vs_v1": 1.51
+      "reference_ms": 1.9517,
+      "kernel_v1_ms": 0.1464,
+      "kernel_v2_ms": 0.0645,
+      "v1_speedup_vs_reference": 13.33,
+      "v2_speedup_vs_reference": 30.25,
+      "v2_speedup_vs_v1": 2.27
     },
     {
       "batch": 8,
       "seq_len": 2048,
-      "reference_ms": 3.6157,
-      "kernel_v1_ms": 0.2416,
-      "kernel_v2_ms": 0.1772,
-      "v1_speedup_vs_reference": 14.96,
-      "v2_speedup_vs_reference": 20.41,
-      "v2_speedup_vs_v1": 1.36
+      "reference_ms": 3.926,
+      "kernel_v1_ms": 0.1802,
+      "kernel_v2_ms": 0.0707,
+      "v1_speedup_vs_reference": 21.79,
+      "v2_speedup_vs_reference": 55.57,
+      "v2_speedup_vs_v1": 2.55
     },
     {
       "batch": 16,
       "seq_len": 2048,
-      "reference_ms": 7.4417,
-      "kernel_v1_ms": 0.2499,
-      "kernel_v2_ms": 0.2456,
-      "v1_speedup_vs_reference": 29.78,
-      "v2_speedup_vs_reference": 30.3,
-      "v2_speedup_vs_v1": 1.02
+      "reference_ms": 7.5486,
+      "kernel_v1_ms": 0.1434,
+      "kernel_v2_ms": 0.1577,
+      "v1_speedup_vs_reference": 52.66,
+      "v2_speedup_vs_reference": 47.87,
+      "v2_speedup_vs_v1": 0.91
     },
     {
       "batch": 32,
       "seq_len": 2048,
-      "reference_ms": 15.3017,
-      "kernel_v1_ms": 0.3195,
-      "kernel_v2_ms": 0.3553,
-      "v1_speedup_vs_reference": 47.89,
-      "v2_speedup_vs_reference": 43.06,
-      "v2_speedup_vs_v1": 0.9
+      "reference_ms": 15.2504,
+      "kernel_v1_ms": 0.2201,
+      "kernel_v2_ms": 0.2488,
+      "v1_speedup_vs_reference": 69.29,
+      "v2_speedup_vs_reference": 61.29,
+      "v2_speedup_vs_v1": 0.88
     },
     {
       "batch": 64,
       "seq_len": 2048,
-      "reference_ms": 29.6112,
-      "kernel_v1_ms": 0.512,
-      "kernel_v2_ms": 0.5324,
-      "v1_speedup_vs_reference": 57.83,
-      "v2_speedup_vs_reference": 55.62,
-      "v2_speedup_vs_v1": 0.96
+      "reference_ms": 30.5418,
+      "kernel_v1_ms": 0.4187,
+      "kernel_v2_ms": 0.4434,
+      "v1_speedup_vs_reference": 72.94,
+      "v2_speedup_vs_reference": 68.88,
+      "v2_speedup_vs_v1": 0.94
     }
   ],
   "gpu_name": "NVIDIA GeForce RTX 3060 Laptop GPU",
   "driver_version": "610.74",
-  "power_draw_w": 81.22,
+  "power_draw_w": 83.39,
   "power_limit_w": null,
   "sm_clock_mhz": 1995.0,
   "method": "cuda.Event timing, best-of-30 after 10 warmup iters. reference.py runs fp32 on GPU (per-batch Python loop); kernels run fp16 (single fused kernel over the whole batch). Not a dtype-matched comparison \u2014 each implementation in its natural/enforced dtype. v2 uses its default block_n=128 (v1 has no block_n knob; its tile is fixed to page_size)."

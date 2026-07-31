@@ -38,7 +38,7 @@ seq_lens:    [batch]
 - [x] Correctness: fp32 PyTorch reference implementation
 - [x] Triton v1: naive, paged KV indexing
 - [x] Triton v2: wider tiles (decoupled from page_size) — see Results below; not a strict win over v1
-- [ ] Triton v3: single-pass online softmax
+- [x] Triton v3: single-pass online softmax — already true of v1/v2's design (the running-softmax loop is structurally required at real seq_len, not a separate feature); the only untried part of this item, `num_stages` tuning, gave a real but modest gain (~11% at best) and isn't worth a dedicated kernel file — see [profiles/notes.md](profiles/notes.md). Investigating this surfaced a bigger, unrelated finding: both wrappers had an `assert` on a GPU tensor's value that forced a device-to-host sync, costing 2-3x the raw kernel latency at batch=1 — fixed, and every latency number below reflects the fix.
 - [ ] Triton v4: split-K along the sequence dimension
 - [ ] CUDA C++: explicit shared-memory tiling, bank-conflict elimination
 - [ ] CUDA C++: warp-shuffle reduction, occupancy analysis
@@ -52,8 +52,8 @@ seq_lens:    [batch]
 
 **v1 (Triton, naive)** — GQA ratio 6, head_dim 128, page_size 16, seq_len 2048:
 
-- Latency vs. the naive per-batch reference loop: 1.9x at batch=1, up to
-  55.2x at batch=64 — this beats a naive Python loop, it is not yet a
+- Latency vs. the naive per-batch reference loop: 5.6x at batch=1, up to
+  72.9x at batch=64 — this beats a naive Python loop, it is not yet a
   claim of beating a strong baseline; that comparison (vs. FlashInfer) is
   Week 6's job.
 - NCU at batch=1 (the realistic single-request decode case): grid is
@@ -80,10 +80,10 @@ both directions:**
 
 | batch | v1 | v2 | v2 vs v1 |
 |---|---|---|---|
-| 1 | 0.335 ms | 0.278 ms | **1.21x** |
-| 4 | 0.249 ms | 0.165 ms | **1.51x** |
-| 16 | 0.250 ms | 0.246 ms | 1.02x |
-| 64 | 0.512 ms | 0.532 ms | **0.96x** |
+| 1 | 0.123 ms | 0.078 ms | **1.58x** |
+| 4 | 0.146 ms | 0.065 ms | **2.27x** |
+| 16 | 0.143 ms | 0.158 ms | 0.91x |
+| 64 | 0.419 ms | 0.443 ms | **0.94x** |
 
 v2's wider tile needs enough shared memory that only 1 block can be
 resident per SM at once (v1 allows 8 — `launch__occupancy_limit_shared_mem`).
@@ -98,6 +98,20 @@ better" framing doesn't survive contact with the data. Full numbers and
 mechanism in [profiles/notes.md](profiles/notes.md);
 [bench/results/decode_latency.json](bench/results/decode_latency.json)
 has the full batch sweep.
+
+**Measurement fix that changed every number above**: while investigating
+v3's `num_stages` lever, isolating each step of the wrapper call found
+`assert torch.all(seq_lens >= 1)` — added deliberately to catch a real
+silently-wrong-answer risk — was forcing a device-to-host sync (Python's
+`assert` needs the CUDA tensor's `__bool__()`, which blocks on the GPU).
+That cost 2-3x the raw kernel launch time at batch=1, confirmed
+reproducible across independent runs. Removed from both wrappers'
+hot path; the precondition is still documented and still exercised by the
+test suite, just not paid for on every call. Every number in this README
+and in `profiles/notes.md` reflects the fix — the lesson generalizes past
+this one assert: any check on a GPU tensor's *value* (not just its
+shape/dtype/device) is a sync point, and at sub-millisecond kernel
+latencies that sync can dominate the number being measured.
 
 ## Repo layout
 
