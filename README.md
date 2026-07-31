@@ -37,13 +37,13 @@ seq_lens:    [batch]
 
 - [x] Correctness: fp32 PyTorch reference implementation
 - [x] Triton v1: naive, paged KV indexing
-- [ ] Triton v2: coalesced KV access
+- [x] Triton v2: wider tiles (decoupled from page_size) — see Results below; not a strict win over v1
 - [ ] Triton v3: single-pass online softmax
 - [ ] Triton v4: split-K along the sequence dimension
 - [ ] CUDA C++: explicit shared-memory tiling, bank-conflict elimination
 - [ ] CUDA C++: warp-shuffle reduction, occupancy analysis
 - [ ] CUDA C++: split-K, packaged as a PyTorch extension
-- [x] Correctness test suite for the reference implementation (page boundaries, extreme/ragged/zero-length sequences, non-contiguous block tables with unreferenced "holes", GQA ratios 1/4/6/8, full input-validation coverage, 2000-case randomized fuzz vs. an independently-written SDPA oracle — 81 cases at default settings, `tests/`). Kernel-vs-reference and cross-implementation tests land once Triton/CUDA versions exist.
+- [x] Correctness test suite for the reference implementation (page boundaries, extreme/ragged/zero-length sequences, non-contiguous block tables with unreferenced "holes", GQA ratios 1/4/6/8, full input-validation coverage, 2000-case randomized fuzz vs. an independently-written SDPA oracle) plus kernel-vs-reference suites for v1 and v2 (127 cases at default settings, `tests/`). Cross-implementation (Triton vs. CUDA) tests land once the CUDA version exists.
 - [ ] Nsight-driven optimization log with before/after profiles
 - [ ] Benchmark against FlashInfer (A100)
 - [ ] Roofline plot using measured (not nominal) peak bandwidth
@@ -52,21 +52,52 @@ seq_lens:    [batch]
 
 **v1 (Triton, naive)** — GQA ratio 6, head_dim 128, page_size 16, seq_len 2048:
 
-- Correctness: 112 tests passing by default (81 reference-oracle + 31
-  kernel-vs-reference), plus a 2000-case reference fuzz sweep and a
-  100-case kernel fuzz sweep, both clean.
 - Latency vs. the naive per-batch reference loop: 1.9x at batch=1, up to
-  55.2x at batch=64 (`bench/results/decode_latency_v1.json`) — this beats
-  a naive Python loop, it is not yet a claim of beating a strong baseline;
-  that comparison (vs. FlashInfer) is Week 6's job.
+  55.2x at batch=64 — this beats a naive Python loop, it is not yet a
+  claim of beating a strong baseline; that comparison (vs. FlashInfer) is
+  Week 6's job.
 - NCU at batch=1 (the realistic single-request decode case): grid is
   `(1, 2, 1)` — only 2 thread blocks on a ~28-SM GPU, 8.33% occupancy,
   `long_scoreboard` (memory-wait) is the dominant stall reason. At
   batch=64 the *same* kernel hits 95.14% of peak DRAM bandwidth, showing
   batch=1's low numbers are a parallelism problem specific to low-batch
   decode, not a general kernel inefficiency — the direct, measured
-  motivation for v4's split-K. Full writeup in
-  [profiles/notes.md](profiles/notes.md).
+  motivation for v4's split-K.
+
+**v2 (Triton, wider tiles)** — before writing this, measured whether v1
+actually had a memory-coalescing problem rather than assuming the roadmap's
+original framing: total-sector efficiency was already ~97% of theoretical
+minimum, and sweeping `num_warps` found Triton's own default was already
+optimal. What did move the needle: v1 ties its tile size to `page_size`
+(16), so at seq_len 2048 it runs 128 loop iterations, each starting with a
+`block_table` load the K/V load depends on — matching `long_scoreboard`
+being the dominant stall. v2 decouples the tile size from `page_size`
+(default 128, the largest that fits this GPU's shared memory here), same
+kernel body, fewer/larger iterations.
+
+**Not a strict win — a latency-vs-occupancy tradeoff, reported honestly in
+both directions:**
+
+| batch | v1 | v2 | v2 vs v1 |
+|---|---|---|---|
+| 1 | 0.335 ms | 0.278 ms | **1.21x** |
+| 4 | 0.249 ms | 0.165 ms | **1.51x** |
+| 16 | 0.250 ms | 0.246 ms | 1.02x |
+| 64 | 0.512 ms | 0.532 ms | **0.96x** |
+
+v2's wider tile needs enough shared memory that only 1 block can be
+resident per SM at once (v1 allows 8 — `launch__occupancy_limit_shared_mem`).
+At batch=1 that costs nothing (only 2 blocks exist either way), so v2's
+shorter, less latency-bound loop wins outright. At batch=64, v1 packs 8
+blocks deep per SM and hits 95.14% DRAM throughput; v2 is capped at 1 deep,
+stays pinned at the same 8.33% occupancy as batch=1, and DRAM throughput
+actually drops to 86.95%. v2 wins specifically in the low-batch/
+single-request regime this project's split-K story is about — not
+universally, and the roadmap's original "v2 = coalesced access, strictly
+better" framing doesn't survive contact with the data. Full numbers and
+mechanism in [profiles/notes.md](profiles/notes.md);
+[bench/results/decode_latency.json](bench/results/decode_latency.json)
+has the full batch sweep.
 
 ## Repo layout
 
@@ -89,13 +120,13 @@ RTX 3060 Laptop (6GB) on WSL2 for development; cross-hardware validation planned
 uv venv --python 3.12
 uv pip install -r requirements.txt
 
-# correctness (reference oracle + Triton v1 kernel, needs a CUDA GPU for the kernel half)
+# correctness (reference oracle + Triton v1/v2 kernels, needs a CUDA GPU for the kernel half)
 uv run pytest tests/ -q
 # full 2000-case reference fuzz / 100-case kernel fuzz (defaults are fast subsets):
 PAGED_ATTN_FUZZ_ITERS=2000 uv run pytest tests/test_reference_fuzz.py -q
 PAGED_ATTN_KERNEL_FUZZ_ITERS=100 uv run pytest tests/test_kernel_v1.py::test_fuzz_curated_shape_matrix -q
 
-# latency: reference vs. Triton v1, batch sweep at the primary target shape
+# latency: reference vs. Triton v1 vs. v2, batch sweep at the primary target shape
 uv run python bench/bench_decode.py
 ```
 
