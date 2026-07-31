@@ -13,29 +13,32 @@ already true of v1/v2's design before this file existed — the running
 `m_i`/`l_i`/`acc` update is structurally required at real seq_len (can't
 materialize a [head_dim, seq_len] tile in one shot), not something added
 here. The only genuinely untried part of the roadmap item was
-`num_stages`, which both v1 and v2 left at Triton's own default.
+`num_stages`, which both v1 and v2 left at Triton's default — 3, per
+`triton/backends/nvidia/compiler.py`'s `CUDAOptions` dataclass
+(`num_stages: int = 3`), read directly from the installed 3.6.0 source,
+not assumed.
 
 Swept it directly on the unmodified kernel body before writing this file
 (same discipline as v2's BLOCK_N sweep — measure before building):
 BLOCK_N=128 (v2's config), batch=1, num_stages 1->2->3->4 gave
 0.059->0.047->0.052->0.047 ms; num_stages>=5 hits the same shared-memory
 ceiling BLOCK_N=256 hit in v2 (OutOfResources: wider tiles and deeper
-pipelining spend the same limited shared-memory budget).
+pipelining spend the same limited shared-memory budget). num_stages=3
+(Triton's actual default) already lands close to num_stages=4's result
+in this isolated sweep (0.052 vs. 0.047 ms) — v3's real change is 3->4,
+not "unknown auto-selected value -> 4".
 
-That sweep forced num_stages=1 as the low end of the comparison — it does
-NOT mean v2 (which never sets num_stages, leaving it at Triton's own
-auto-selected default) was running at num_stages=1. A real A/B through
-the full wrapper (bench_decode.py, v3 vs v2, both fp16) shows v3's pinned
-num_stages=4 landing within noise of v2's default across most batch
-sizes (0.98x-1.00x, one outlier at batch=8 of 1.35x) — meaning Triton's
-auto-selected default for this tile size was likely already close to 4,
-the same conclusion the num_warps sweep reached for v2. Reported as what
-it is: a lever that was worth checking, mostly already covered by
-Triton's own heuristics, not a real win to claim.
+A real A/B through the full wrapper (bench_decode.py, v3 vs v2, both
+fp16) shows v3's pinned num_stages=4 landing within noise of v2's
+default (num_stages=3) across most batch sizes (0.98x-1.00x, one outlier
+at batch=8 of 1.35x) — consistent with the isolated sweep above showing
+3 and 4 close together, and the same conclusion the num_warps sweep
+reached for v2. Reported as what it is: a lever that was worth checking,
+already close to Triton's own default, not a real win to claim.
 
 Reuses v1's exact `_paged_attn_decode_v1_kernel`, same as v2. The only
 change from v2 is exposing `num_stages` as an explicit launch parameter
-instead of leaving it at Triton's auto-selected default.
+instead of leaving it at Triton's default of 3.
 """
 
 
