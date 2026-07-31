@@ -1,6 +1,6 @@
-"""Latency: fp32 reference (per-batch Python loop) vs. Triton v1/v2/v3.
+"""Latency: fp32 reference (per-batch Python loop) vs. Triton v1/v2/v3/v4.
 
-All four run on GPU so the comparison isolates "one fused kernel over the
+All five run on GPU so the comparison isolates "one fused kernel over the
 whole batch" vs. "a Python loop issuing many small per-sequence GPU
 launches" — not a CPU-vs-GPU comparison. Each implementation runs in its
 own natural dtype (reference.py is fp32-only by design; the kernels are
@@ -11,11 +11,22 @@ Fixed at the primary target shape (Qwen2.5-1.5B-like: GQA ratio 6, head_dim
 128, page_size 16) and a representative mid-length context (seq_len 2048),
 sweeping batch size — this is the axis that matters for the project's
 occupancy story (small batch * few KV heads = most SMs idle on this GPU).
+
+Median-of-interleaved-trials, not a single best-of-N: at these
+sub-millisecond kernel latencies, a single best-of-N reading turned out
+to be dominated by run-to-run GPU clock/power-state noise on this laptop
+GPU rather than real differences between implementations (discovered
+while sweeping v4's num_splits — repeated identical runs picked different
+"best" configs each time). Interleaving trials round-robin across all
+five implementations per round, rather than finishing one implementation's
+iterations before starting the next, spreads any thermal drift evenly
+instead of systematically favoring whichever runs first or last.
 """
 
 from __future__ import annotations
 
 import json
+import statistics
 import sys
 import time
 from pathlib import Path
@@ -28,6 +39,7 @@ from measure_peak_bw import _gpu_power_state  # same dir as this script; reuse t
 from src.kernel_v1_naive import paged_attention_decode_v1
 from src.kernel_v2_coalesced import paged_attention_decode_v2
 from src.kernel_v3_online_softmax import paged_attention_decode_v3
+from src.kernel_v4_split_k import paged_attention_decode_v4
 from src.reference import paged_attention_decode_reference
 
 NUM_KV_HEADS = 2
@@ -36,6 +48,8 @@ NUM_Q_HEADS = NUM_KV_HEADS * GQA_RATIO
 HEAD_DIM = 128
 PAGE_SIZE = 16
 SEQ_LEN = 2048
+
+TRIALS = 15  # independent, interleaved best-of-N measurements per implementation
 
 
 def _make_uniform_batch(batch: int, seq_len: int, seed: int = 0):
@@ -53,7 +67,7 @@ def _make_uniform_batch(batch: int, seq_len: int, seed: int = 0):
     return q, k_cache, v_cache, block_table, seq_lens
 
 
-def _time_cuda(fn, iters: int = 30, warmup: int = 10) -> float:
+def _time_cuda_once(fn, iters: int = 30, warmup: int = 10) -> float:
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
@@ -69,6 +83,17 @@ def _time_cuda(fn, iters: int = 30, warmup: int = 10) -> float:
         torch.cuda.synchronize()
         best_ms = min(best_ms, start.elapsed_time(end))
     return best_ms
+
+
+def _median_of_trials(fns: dict) -> dict:
+    """fns: {name: callable}. Returns {name: median_ms}, interleaving
+    trials round-robin across all names rather than finishing one name's
+    trials before starting the next."""
+    samples = {name: [] for name in fns}
+    for _ in range(TRIALS):
+        for name, fn in fns.items():
+            samples[name].append(_time_cuda_once(fn))
+    return {name: statistics.median(vals) for name, vals in samples.items()}
 
 
 def main() -> None:
@@ -90,18 +115,15 @@ def main() -> None:
         k_fp16 = k_cache.half().cuda()
         v_fp16 = v_cache.half().cuda()
 
-        ref_ms = _time_cuda(
-            lambda: paged_attention_decode_reference(q_fp32, k_fp32, v_fp32, bt_cuda, sl_cuda)
-        )
-        v1_ms = _time_cuda(
-            lambda: paged_attention_decode_v1(q_fp16, k_fp16, v_fp16, bt_cuda, sl_cuda)
-        )
-        v2_ms = _time_cuda(
-            lambda: paged_attention_decode_v2(q_fp16, k_fp16, v_fp16, bt_cuda, sl_cuda)
-        )
-        v3_ms = _time_cuda(
-            lambda: paged_attention_decode_v3(q_fp16, k_fp16, v_fp16, bt_cuda, sl_cuda)
-        )
+        fns = {
+            "reference": lambda: paged_attention_decode_reference(q_fp32, k_fp32, v_fp32, bt_cuda, sl_cuda),
+            "v1": lambda: paged_attention_decode_v1(q_fp16, k_fp16, v_fp16, bt_cuda, sl_cuda),
+            "v2": lambda: paged_attention_decode_v2(q_fp16, k_fp16, v_fp16, bt_cuda, sl_cuda),
+            "v3": lambda: paged_attention_decode_v3(q_fp16, k_fp16, v_fp16, bt_cuda, sl_cuda),
+            "v4": lambda: paged_attention_decode_v4(q_fp16, k_fp16, v_fp16, bt_cuda, sl_cuda),
+        }
+        m = _median_of_trials(fns)
+        ref_ms, v1_ms, v2_ms, v3_ms, v4_ms = m["reference"], m["v1"], m["v2"], m["v3"], m["v4"]
 
         results.append(
             {
@@ -111,17 +133,20 @@ def main() -> None:
                 "kernel_v1_ms": round(v1_ms, 4),
                 "kernel_v2_ms": round(v2_ms, 4),
                 "kernel_v3_ms": round(v3_ms, 4),
+                "kernel_v4_ms": round(v4_ms, 4),
                 "v1_speedup_vs_reference": round(ref_ms / v1_ms, 2),
                 "v2_speedup_vs_reference": round(ref_ms / v2_ms, 2),
                 "v3_speedup_vs_reference": round(ref_ms / v3_ms, 2),
+                "v4_speedup_vs_reference": round(ref_ms / v4_ms, 2),
                 "v2_speedup_vs_v1": round(v1_ms / v2_ms, 2),
                 "v3_speedup_vs_v2": round(v2_ms / v3_ms, 2),
+                "v4_speedup_vs_v1": round(v1_ms / v4_ms, 2),
             }
         )
         print(
             f"batch={batch:3d}: reference {ref_ms:9.4f} ms | v1 {v1_ms:8.4f} ms | "
-            f"v2 {v2_ms:8.4f} ms | v3 {v3_ms:8.4f} ms | v3 vs v2 {v2_ms / v3_ms:5.2f}x | "
-            f"v3 vs reference {ref_ms / v3_ms:6.1f}x"
+            f"v2 {v2_ms:8.4f} ms | v3 {v3_ms:8.4f} ms | v4 {v4_ms:8.4f} ms | "
+            f"v4 vs v1 {v1_ms / v4_ms:5.2f}x | v4 vs reference {ref_ms / v4_ms:6.1f}x"
         )
 
     record = {
@@ -134,13 +159,18 @@ def main() -> None:
             "seq_len": SEQ_LEN,
         },
         "sweep": results,
+        "trials_per_config": TRIALS,
         **_gpu_power_state(),
-        "method": "cuda.Event timing, best-of-30 after 10 warmup iters. reference.py "
-        "runs fp32 on GPU (per-batch Python loop); kernels run fp16 (single fused "
-        "kernel over the whole batch). Not a dtype-matched comparison — each "
-        "implementation in its natural/enforced dtype. v2/v3 use their default "
-        "block_n=128 (v1 has no block_n knob; its tile is fixed to page_size); "
-        "v3 additionally pins num_stages=4 instead of Triton's auto-selected default.",
+        "method": f"cuda.Event timing, best-of-30 after 10 warmup iters PER TRIAL, "
+        f"{TRIALS} independent trials per implementation in round-robin order "
+        "(not blocked per implementation) to spread thermal/clock drift evenly, "
+        "median across trials reported. reference.py runs fp32 on GPU (per-batch "
+        "Python loop); kernels run fp16 (single fused kernel over the whole "
+        "batch, v4 = phase1+phase2). Not a dtype-matched comparison — each "
+        "implementation in its natural/enforced dtype. v2/v3/v4 use block_n=128 "
+        "(v1 has no block_n knob; its tile is fixed to page_size); v3 additionally "
+        "pins num_stages=4; v4 uses num_splits=16 (from bench_v4_num_splits.py's "
+        "sweep at batch=1).",
     }
 
     out_path = Path(__file__).parent / "results" / "decode_latency.json"

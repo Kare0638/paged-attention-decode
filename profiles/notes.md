@@ -279,15 +279,19 @@ one assert: any `assert`/`if` on a GPU tensor's *value* (not just its
 shape/dtype/device) is a synchronization point, and at sub-millisecond
 kernel latencies that sync can dominate the number being measured.
 
-## Triton v3 — num_stages formalized, and it doesn't beat Triton's own default (2026-07-30)
+## Triton v3 — num_stages formalized, and it barely beats Triton's own default (2026-07-30)
 
 `src/kernel_v3_online_softmax.py` reuses v1's kernel body (same as v2),
 block_n=128 (same as v2's default), plus an explicit `num_stages=4`
-instead of leaving it at whatever Triton auto-selects. Written up as a
-real file — matching the repo layout's documented naming — even though
-the roadmap's v3 description (single-pass online softmax, no
+instead of leaving it at Triton's default. That default is **3**, not an
+unknown auto-selected value — confirmed by reading
+`triton/backends/nvidia/compiler.py`'s `CUDAOptions` dataclass directly
+(`num_stages: int = 3`) in the installed Triton 3.6.0 source. Written up
+as a real file — matching the repo layout's documented naming — even
+though the roadmap's v3 description (single-pass online softmax, no
 intermediate materialization) was already satisfied by v1/v2's design
-before this file existed; the only new thing here is the num_stages pin.
+before this file existed; the only new thing here is the num_stages pin,
+i.e. this is a 3->4 change, not "default -> 4."
 
 **Real A/B through the full wrapper** (`bench/bench_decode.py`, v3 vs v2,
 both fp16, same shape):
@@ -307,12 +311,12 @@ repeat at neighboring batch sizes. This does *not* contradict the earlier
 num_stages sweep (which showed a clear 1->4 improvement on the raw kernel
 body) — that sweep's num_stages=1 was a forced low baseline for
 comparison, not what v2 was actually running. v2 never sets num_stages;
-it uses Triton's auto-selected default, which for this tile size was
-apparently already close to 4. Same conclusion the num_warps sweep
-reached before v2 was written: Triton's own heuristics for this kernel
-are already close to what a manual sweep finds, and the honest report is
-"checked, mostly already covered" rather than inflating a noise-level
-result into a claimed win.
+it uses Triton's default of 3, and the isolated sweep already showed 3
+landing close to 4 (0.052 vs. 0.047 ms at batch=1). Same conclusion the
+num_warps sweep reached before v2 was written: Triton's own defaults for
+this kernel are already close to what a manual sweep finds, and the
+honest report is "checked, marginal at best" rather than inflating a
+noise-level result into a claimed win.
 
 **Where the real wins came from, in order**: v1->v2's BLOCK_N change
 (up to 2.15x on the raw kernel, 1.21x-2.55x through the wrapper depending
@@ -322,4 +326,160 @@ consistent, mechanistically-understood effect (fewer dependent
 `num_warps` and `num_stages` tuning were checked and found to add little
 on top of Triton's defaults. The next lever with an *a priori* large,
 well-understood effect is v4's split-K — batch=1 is still capped at 2
-thread blocks on a ~28-SM GPU regardless of any of the tuning done so far.
+
+## Triton v4 — split-K (2026-07-31)
+
+`src/kernel_v4_split_k.py`: phase 1 (grid `(batch, num_kv_heads,
+num_splits)`) computes unnormalized partial `(O, m, l)` per chunk of the
+sequence; phase 2 (grid `(batch, num_kv_heads)`) reduces across splits
+with the standard online-softmax merge, explicitly guarded against
+`exp(-inf - -inf)` rather than relying on split 0 always being non-empty.
+Full derivation in `analysis/split_k_derivation.md`. Correctness
+double-checked beyond the usual reference comparison: `num_splits=1` at
+`block_n=16` (matching v1's hardcoded tile exactly) reproduces v1's
+output **bit-for-bit** (0.0 max diff) — confirming split-K is a pure
+reassociation of v1's math, not a different algorithm that happens to
+pass a loose tolerance. Split-invariance (`num_splits` ∈ {1,2,4,8,16} all
+agreeing with the fp32 reference independently) holds throughout a
+200-iteration fuzz sweep.
+
+One correctness-suite side effect, found while chasing this: a specific
+ragged-batch case had one output element near zero (`expected ≈
+-0.0044`) fail at the shared `atol=1e-3` tolerance (`tests/
+kernel_test_utils.py`). First response was to bump `atol` to `2e-3` —
+but the real bug was upstream of the tolerance, in `compare_to_reference`
+itself: it computed the fp32 reference from the *original* fp32 inputs,
+while the kernel only ever saw fp16-rounded versions of them. That
+mixes two different error sources into one measured diff — the kernel's
+own compute error, and fp16 input-quantization error the kernel had no
+part in — and near-zero output elements are exactly where fp16
+quantization error is proportionally largest (~20% relative, confirmed
+by checking v1 alone, no split-K involved, against the identical
+seed/shape: same near-zero element, same-sized discrepancy). Fixed
+`compare_to_reference` to round `q`/`k_cache`/`v_cache` through fp16
+*before* computing the reference, so both the reference and the kernel
+see identical values — `atol` went back down to `1e-3`, verified across
+a 300-iteration fuzz sweep on all four kernel versions (652 cases), not
+just the one case that originally failed. Not a reduction bug in v4 —
+a test methodology gap that affected every kernel version equally, v4
+was just the one that happened to surface it first for a given seed.
+
+### `num_splits` sweep — and a measurement methodology fix
+
+`num_splits` ships with no default until a sweep sets one (same
+discipline as v2's `block_n=128`, v3's `num_stages=4`). First attempts
+at this sweep (`bench/bench_v4_num_splits.py`, best-of-N single
+readings) were not reproducible run to run — the "best" `num_splits`
+value changed on every rerun of an unmodified script. Root cause: at
+these sub-0.1ms latencies, run-to-run GPU clock/power-state noise on
+this laptop GPU dominates the actual differences between configs.
+Verified directly: 25 interleaved v1/v4 samples at batch=1 gave v4 a
+stdev of 0.0254ms against a mean of 0.068ms (~37% CV) with several
+anomalously fast outlier readings, vs. v1's much tighter 0.0148ms stdev
+on 0.124ms mean (~12% CV) — v4's two-kernel pipeline is inherently
+noisier to measure, not just unluckily sampled.
+
+Fixed by switching both `bench_v4_num_splits.py` and `bench_decode.py`
+to **median of several independent, interleaved trials** rather than a
+single best-of-N: round-robin across all configs each round (not all of
+config A's iterations, then all of config B's) so thermal drift over the
+sweep doesn't systematically favor whichever config happens to run
+first, and median is far less sensitive than min to one lucky low-noise
+reading. This reproduced consistently across repeated full reruns.
+
+**Result — a broad, flat plateau, not a sharp peak** (unlike `block_n`
+or `num_stages`, which each had one clear best value):
+
+| num_splits | speedup vs. v1 |
+|---|---|
+| 1 | 1.26x–1.37x |
+| 2 | 1.73x–1.83x |
+| 4 | 1.68x–1.88x |
+| 8 | 1.61x–1.83x |
+| 16 | 1.64x–1.85x |
+| 32 | 1.66x–1.76x |
+| 64 | 1.57x–1.71x |
+| 128 | 1.22x–1.25x |
+
+(ranges across two independent 9-trial-median sweeps). `num_splits=16`
+chosen as the default: middle of the plateau, and `batch(1) *
+num_kv_heads(2) * num_splits(16) = 32` lands close to the ~28-SM count
+this project's occupancy story is built around — both an a priori
+reasonable target and empirically inside the measured sweet spot, not
+picked for only one of those reasons. `num_splits=1` underperforms (no
+parallelism gain, still pays phase 2's fixed overhead); `num_splits=128`
+underperforms more (chunks become much shorter than the `block_n=128`
+tile, wasting bandwidth on masked lanes within each split, on top of
+phase 2 reducing over more terms) — full sweep data (all 9 trials per
+config, not just the median) in `bench/results/v4_num_splits_sweep.json`.
+
+### Latency vs. v1 across the batch sweep
+
+`bench_decode.py` updated to the same median-of-15-interleaved-trials
+methodology for the same noise reason. Reproduced across two full runs:
+
+| batch | v4 vs. v1 |
+|---|---|
+| 1 | **1.83x** (both runs) |
+| 2 | 1.84x–2.00x |
+| 4 | 1.49x–1.73x |
+| 8 | 1.17x–1.35x |
+| 16 | 0.94x–1.00x (crossover) |
+| 32 | 0.80x–0.85x |
+| 64 | 0.75x–0.82x |
+
+Same shape as v2's tradeoff: a real win concentrated at low batch (the
+scenario this whole kernel exists for), a real loss at high batch,
+reported in both directions rather than only the favorable one.
+
+### NCU, batch=1 vs. batch=64, phase 1 and phase 2 separately
+
+A metric-interpretation lesson worth recording: `sm__warps_active.avg.
+pct_of_peak_sustained_active` reads **8.33% for phase 1 at both batch=1
+and batch=64** — identical to v1's batch=1 number — which looks at first
+glance like occupancy didn't improve at all. NVIDIA's definition:
+achieved occupancy, the ratio of active warps per active cycle to the
+hardware maximum warps per SM (the "achieved_occupancy" successor metric,
+per NVIDIA's own Nsight Compute docs) — it does *not* measure how many of
+the ~28 SMs received any work at all, only how full the SMs that *did*
+run something were while they were running it. Phase 1's number reads
+identically to v1's for two different reasons that happen to coincide,
+not one: v1 at batch=1 has room for up to 8 resident blocks/SM
+(register/shared-mem limit) but only 2 blocks exist in the whole grid, so
+whichever 1-2 SMs get work only ever run 1 block each — occupancy is low
+because the *grid* is too small to fill even one SM's generous capacity.
+Phase 1 (same `block_n=128` tile as v2) has a real, grid-size-independent
+ceiling of exactly 1 resident block/SM (`launch__occupancy_limit_shared_mem`),
+so any SM that runs it is capped at that same 1-block achieved occupancy
+no matter how many total blocks are in flight elsewhere on the GPU. Both
+land on the same ratio (1 block's worth of warps against the hardware
+max) for unrelated reasons. The metrics that actually capture "did
+split-K spread work across more of the GPU" are throughput-based, and
+those move a lot:
+
+| metric | v1, batch=1 | phase 1, batch=1 | v1, batch=64 | phase 1, batch=64 |
+|---|---|---|---|---|
+| grid size | 2 | **32** | 128 | **2048** |
+| `dram__throughput` | 5.43% | **37.00%** | 95.14% | **78.43%** |
+| `sm__throughput` | 1.27% | **7.21%** | (n/a) | 15.14% |
+| `sm__warps_active` | 8.33% | 8.33% (coincidence, see above) | 35.37% | 8.32% (real per-SM ceiling) |
+
+At batch=1, phase 1's 32 blocks reach most of the ~28 SMs at once
+(instead of 2), and DRAM throughput jumps 6.8x (5.43%→37.00%) even
+though the achieved-occupancy metric reads identically to v1. At
+batch=64, phase 1's DRAM throughput (78.43%) is *lower* than v1's at the
+same batch (95.14%) — this is the NCU-level evidence for the latency
+regression: splitting fragments what would otherwise be efficient
+`block_n=128`-sized transfers into more, smaller ones, and that
+fragmentation cost isn't worth paying once batch alone already supplies
+enough parallelism.
+
+Phase 2 is itself still occupancy-starved at batch=1 by the same
+mechanism v1 was built to fix — grid `(batch, num_kv_heads)` = 2 blocks,
+`sm__warps_active` 6.79% — but cheap in absolute terms (`sm__throughput`
+0.56%, `dram__throughput` 4.75%: O(num_splits) work per program, not
+O(seq_len)). At batch=64, phase 2's grid grows to 128 blocks and its own
+`sm__warps_active` reaches 25.40% (no shared-memory ceiling to hit at
+this buffer size, unlike phase 1) — phase 2 was never the bottleneck at
+either batch size; phase 1's occupancy/fragmentation tradeoff is the
+whole story.

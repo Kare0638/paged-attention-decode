@@ -4,7 +4,7 @@ Decode-phase attention kernel for LLM inference with paged KV cache and GQA supp
 
 ## Status
 
-🚧 Early development. Environment and tooling verification in progress; kernel implementations have not landed yet. This README gets updated with real benchmark numbers as each version ships — no numbers are reported until they're measured.
+Triton v1–v4 (naive, wider tiles, num_stages tuning, split-K) are implemented, tested, and benchmarked — see Results below. CUDA C++ and the A100/FlashInfer comparison are still ahead. This README gets updated with real benchmark numbers as each version ships — no numbers are reported until they're measured.
 
 ## Why this project
 
@@ -31,19 +31,19 @@ block_table: [batch, max_pages_per_seq]   # logical page -> physical page
 seq_lens:    [batch]
 ```
 
-**Split-K reduction** — the sequence dimension is split into chunks; phase 1 computes per-chunk partial `(O, m, l)` online-softmax statistics, phase 2 reduces across chunks. Derivation lives in [analysis/](analysis/).
+**Split-K reduction** — the sequence dimension is split into chunks; phase 1 computes per-chunk partial `(O, m, l)` online-softmax statistics, phase 2 reduces across chunks. Derivation lives in [analysis/split_k_derivation.md](analysis/split_k_derivation.md).
 
 ## Roadmap
 
 - [x] Correctness: fp32 PyTorch reference implementation
 - [x] Triton v1: naive, paged KV indexing
 - [x] Triton v2: wider tiles (decoupled from page_size) — see Results below; not a strict win over v1
-- [x] Triton v3: single-pass online softmax — already true of v1/v2's design (the running-softmax loop is structurally required at real seq_len, not a separate feature). `src/kernel_v3_online_softmax.py` formalizes the one thing left to try, an explicit `num_stages=4` pin, but a real A/B through the wrapper shows it within noise of v2's Triton-auto-selected default at 6 of 7 batch sizes — reported as "checked, mostly already covered," not inflated into a claimed win. Investigating it surfaced a bigger, unrelated finding: both v1/v2's wrappers had an `assert` on a GPU tensor's value that forced a device-to-host sync, costing 2-3x the raw kernel latency at batch=1 — fixed, and every latency number below reflects the fix.
-- [ ] Triton v4: split-K along the sequence dimension
+- [x] Triton v3: single-pass online softmax — already true of v1/v2's design (the running-softmax loop is structurally required at real seq_len, not a separate feature). `src/kernel_v3_online_softmax.py` formalizes the one thing left to try, an explicit `num_stages=4` pin (Triton's own default is 3, confirmed from the installed 3.6.0 source), but a real A/B through the wrapper shows it within noise of v2's default at 6 of 7 batch sizes — reported as "checked, marginal at best," not inflated into a claimed win. Investigating it surfaced a bigger, unrelated finding: both v1/v2's wrappers had an `assert` on a GPU tensor's value that forced a device-to-host sync, costing 2-3x the raw kernel latency at batch=1 — fixed, and every latency number below reflects the fix.
+- [x] Triton v4: split-K along the sequence dimension — real win at low batch (1.83x vs. v1 at batch=1), real loss at high batch (0.75x-0.85x at 32/64), same tradeoff shape as v2, reported in both directions — see Results below
 - [ ] CUDA C++: explicit shared-memory tiling, bank-conflict elimination
 - [ ] CUDA C++: warp-shuffle reduction, occupancy analysis
 - [ ] CUDA C++: split-K, packaged as a PyTorch extension
-- [x] Correctness test suite for the reference implementation (page boundaries, extreme/ragged/zero-length sequences, non-contiguous block tables with unreferenced "holes", GQA ratios 1/4/6/8, full input-validation coverage, 2000-case randomized fuzz vs. an independently-written SDPA oracle) plus kernel-vs-reference suites for v1, v2, and v3 (139 cases at default settings, `tests/`). Cross-implementation (Triton vs. CUDA) tests land once the CUDA version exists.
+- [x] Correctness test suite for the reference implementation (page boundaries, extreme/ragged/zero-length sequences, non-contiguous block tables with unreferenced "holes", GQA ratios 1/4/6/8, full input-validation coverage, 2000-case randomized fuzz vs. an independently-written SDPA oracle) plus kernel-vs-reference suites for v1, v2, v3, and v4 (173 cases at default settings, `tests/`), including v4's split-invariance check and a bit-exact `num_splits=1`-vs-v1 equivalence test. Cross-implementation (Triton vs. CUDA) tests land once the CUDA version exists.
 - [ ] Nsight-driven optimization log with before/after profiles
 - [ ] Benchmark against FlashInfer (A100)
 - [ ] Roofline plot using measured (not nominal) peak bandwidth
@@ -114,17 +114,70 @@ shape/dtype/device) is a sync point, and at sub-millisecond kernel
 latencies that sync can dominate the number being measured.
 
 **v3 (Triton, num_stages pinned)** — same kernel body and tile size as
-v2, `num_stages=4` explicit instead of Triton's auto-selected default. A
-real A/B through the wrapper (v3 vs. v2, same shape) landed within noise
-at 6 of 7 batch sizes (0.98x-1.00x, one outlier of 1.35x at batch=8 that
-doesn't repeat at neighboring batches) — Triton's own default for this
-tile size was apparently already close to 4, the same conclusion the
-`num_warps` sweep reached before v2 existed. Reported honestly as a
-lever that was checked and mostly already covered, not as a win. Of the
+v2, `num_stages=4` explicit instead of Triton's default (3, confirmed
+from the installed 3.6.0 source, not assumed). A real A/B through the
+wrapper (v3 vs. v2, same shape) landed within noise at 6 of 7 batch
+sizes (0.98x-1.00x, one outlier of 1.35x at batch=8 that doesn't repeat
+at neighboring batches) — consistent with an isolated sweep showing 3
+and 4 close together (0.052 vs. 0.047 ms at batch=1), the same
+conclusion the `num_warps` sweep reached before v2 existed. Reported
+honestly as a lever that was checked and found marginal, not as a win.
+Of the
 levers tried so far, only v1->v2's tile-size change had a real,
 consistent, mechanistically-understood effect; the next one with an
 a priori large effect is v4's split-K — batch=1 is still capped at 2
 thread blocks on a ~28-SM GPU no matter how any of v1/v2/v3 are tuned.
+
+**v4 (Triton, split-K)** — grid over `(batch, num_kv_heads)` alone caps
+batch=1 at 2 thread blocks on a ~28-SM GPU no matter how v1/v2/v3 are
+tuned. v4 adds a third grid dimension over chunks of the sequence: phase
+1 computes unnormalized partial `(O, m, l)` per `(batch, kv_head,
+split)`, phase 2 reduces across splits (derivation in
+[analysis/split_k_derivation.md](analysis/split_k_derivation.md)).
+Double-checked beyond the usual reference comparison: `num_splits=1` at
+`block_n=16` (matching v1's tile exactly) reproduces v1's output
+**bit-for-bit**, confirming split-K is a pure reassociation of v1's math.
+
+`num_splits` has no default until `bench/bench_v4_num_splits.py`'s sweep
+at batch=1 set one — same discipline as v2's `block_n=128` and v3's
+`num_stages=4`. Unlike those two, the result is a **broad, flat plateau**
+(num_splits 2 through 64 all within ~10% of each other), not one sharp
+peak; `num_splits=16` sits in the middle of it. (Getting a stable sweep
+at all required fixing the benchmark's own methodology first — at these
+sub-0.1ms latencies, single best-of-N readings were dominated by
+run-to-run GPU clock noise on this laptop GPU, not real differences
+between configs; fixed by switching to median-of-interleaved-trials,
+reproduced across independent reruns. Detail in
+[profiles/notes.md](profiles/notes.md).)
+
+**Same tradeoff shape as v2 — a real win at low batch, a real loss at
+high batch, both reported:**
+
+| batch | v4 vs. v1 |
+|---|---|
+| 1 | **1.83x** |
+| 4 | 1.49x–1.73x |
+| 16 | 0.94x–1.00x (crossover) |
+| 64 | 0.75x–0.82x |
+
+NCU explains why, with a methodological catch worth flagging: phase 1's
+`sm__warps_active` reads 8.33% at batch=1 — identical to v1's number —
+which looks like occupancy didn't improve. It's normalized to the
+kernel's *own* per-SM ceiling (shared memory still caps 1 block/SM, same
+`block_n=128` tile as v2), not to whole-GPU utilization, so it stays
+flat whenever that per-block ceiling doesn't change. The metrics that
+actually show more of the GPU getting used are throughput-based: at
+batch=1, phase 1's 32 blocks (vs. v1's 2) push `dram__throughput` from
+5.43% to **37.00%** and `sm__throughput` from 1.27% to **7.21%**. At
+batch=64, phase 1's `dram__throughput` (78.43%) is *lower* than v1's at
+the same batch (95.14%) — splitting fragments what would otherwise be
+efficient transfers into more, smaller ones, and that cost isn't worth
+paying once batch alone already supplies enough parallelism. Full
+mechanism, phase 1 vs. phase 2 breakdown, and the num_splits sweep table
+in [profiles/notes.md](profiles/notes.md);
+[bench/results/v4_num_splits_sweep.json](bench/results/v4_num_splits_sweep.json)
+and [bench/results/decode_latency.json](bench/results/decode_latency.json)
+have the full data.
 
 ## Repo layout
 
@@ -147,14 +200,16 @@ RTX 3060 Laptop (6GB) on WSL2 for development; cross-hardware validation planned
 uv venv --python 3.12
 uv pip install -r requirements.txt
 
-# correctness (reference oracle + Triton v1/v2/v3 kernels, needs a CUDA GPU for the kernel half)
+# correctness (reference oracle + Triton v1/v2/v3/v4 kernels, needs a CUDA GPU for the kernel half)
 uv run pytest tests/ -q
 # full 2000-case reference fuzz / 100-case kernel fuzz (defaults are fast subsets):
 PAGED_ATTN_FUZZ_ITERS=2000 uv run pytest tests/test_reference_fuzz.py -q
 PAGED_ATTN_KERNEL_FUZZ_ITERS=100 uv run pytest tests/test_kernel_v1.py::test_fuzz_curated_shape_matrix -q
 
-# latency: reference vs. Triton v1 vs. v2 vs. v3, batch sweep at the primary target shape
+# latency: reference vs. Triton v1 vs. v2 vs. v3 vs. v4, batch sweep at the primary target shape
 uv run python bench/bench_decode.py
+# v4's num_splits sweep at batch=1 (sets the wrapper's default)
+uv run python bench/bench_v4_num_splits.py
 ```
 
 ## License
