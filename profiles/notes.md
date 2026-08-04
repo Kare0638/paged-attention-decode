@@ -483,3 +483,106 @@ O(seq_len)). At batch=64, phase 2's grid grows to 128 blocks and its own
 this buffer size, unlike phase 1) — phase 2 was never the bottleneck at
 either batch size; phase 1's occupancy/fragmentation tradeoff is the
 whole story.
+
+## CUDA v1 — naive baseline (2026-08-04)
+
+First CUDA C++ kernel in this project, and the first time a kernel here is
+built via `torch.utils.cpp_extension.load` (JIT) rather than Triton's own
+JIT — verified that path works with a throwaway 5-line add-kernel before
+writing any real logic on top of it (same "prove the tool before relying
+on it" discipline as Week 0's raw-`nvcc` check).
+
+`cuda/kernel_v1_naive.cu` is a direct port of `_paged_attn_decode_v1_kernel`'s
+algorithm (same grid, `(batch, num_kv_heads)`; same online-softmax
+recurrence), but deliberately **more naive** than Triton v1: no page-tile
+batching (Triton's `tl.dot` computes a whole `[GQA_RATIO_PADDED, BLOCK_N]`
+score tile per iteration via one matmul instruction; this kernel loops
+token-by-token, one block-wide reduction per `(row, token)` pair) and no
+K/V sharing across the `gqa_ratio` rows (each row redundantly re-reads the
+same K/V values from global memory). That gap is intentional — v2's
+"shared-memory tiling" roadmap item is specifically what removes it, and
+needs a naive baseline to be measured against, the same role Triton v1
+played for Triton v2's tile-size change.
+
+**Correctness**: `tests/test_kernel_cuda_v1.py` mirrors
+`tests/test_kernel_v1.py`'s shape matrix exactly (same tolerance,
+`rtol=1e-2/atol=1e-3`) — all 31 cases pass, no separate tolerance handling
+needed. Unlike Triton, CUDA has no `tl.arange` power-of-2 constraint and no
+`tl.dot` K>=16 floor, so the wrapper's validation is a genuine subset of
+Triton v1's — see `src/kernel_cuda_v1.py`'s docstring for which checks
+don't carry over and why.
+
+**Latency vs. Triton v1** (`bench_decode.py`, same median-of-15-trials
+methodology, primary target shape):
+
+| batch | Triton v1 | CUDA v1 | CUDA v1 vs. Triton v1 |
+|---|---|---|---|
+| 1 | 0.131 ms | 6.008 ms | 0.02x (~46x slower) |
+| 16 | 0.175 ms | 6.960 ms | 0.03x (~40x slower) |
+| 64 | 0.423 ms | 13.348 ms | 0.03x (~32x slower) |
+
+Reported as what it is: a much slower, much more naive kernel, not a
+regression from a working baseline — there was no CUDA baseline before
+this. The gap is the direct, expected cost of processing one token at a
+time with a full block-synchronizing reduction per token per row, instead
+of Triton's tiled matmul.
+
+**NCU mechanism — a different bottleneck than Triton v1's, not the same
+one measured worse.** Triton v1 (`profiles/notes.md`, above) is
+memory-latency-bound: `long_scoreboard` (waiting on global memory) is its
+dominant stall reason. CUDA v1's dominant stalls, at batch=1
+(`smsp__average_warp_latency_issue_stalled_*.ratio`, relative units):
+
+| stall reason | ratio |
+|---|---|
+| `wait` (fixed-latency math pipe — the per-token `__expf`/division calls) | 3,967,707 |
+| `short_scoreboard` (shared-memory round trip — the tree reduction) | 2,730,034 |
+| `barrier` (explicit `__syncthreads()`) | 2,363,041 |
+| `long_scoreboard` (global memory) | 1,234,248 |
+| `no_instruction` | 172,318 |
+| `not_selected` | 0 |
+
+`long_scoreboard` — Triton v1's dominant reason — is CUDA v1's *smallest*
+nonzero category. This kernel isn't memory-bound at all:
+`dram__throughput` reads 0.92% at batch=1 (Triton v1: 5.43%, itself
+already low), and `sm__throughput` is 1.64%. The bottleneck is raw
+instruction/synchronization volume — at batch=1 (only 2 thread blocks
+total), the kernel still issues 1,474,560 shared-memory load instructions
+and 786,432 shared-memory stores (`smsp__inst_executed_op_shared_{ld,st}.sum`),
+one full block-wide tree-reduction-and-barrier per token per row,
+`gqa_ratio(6) * seq_len(2048)` times per block. This is exactly what v2's
+shared-memory K/V tiling is expected to fix — by amortizing that
+reduction/barrier cost over far fewer, larger iterations — not primarily a
+memory-bandwidth win the way Triton v1→v2 was framed, a different
+mechanism for a similarly-named optimization.
+
+Occupancy: grid `(1, 2, 1)` at batch=1, `sm__warps_active` 8.33% —
+identical to Triton v1's number, and the same root cause (2 blocks total
+on a ~28-SM GPU; `launch__occupancy_limit_registers` says up to 12 blocks
+would fit per SM, so it's a grid-size problem, not a resource ceiling). At
+batch=64, grid grows to `(64, 2, 1)` = 128 blocks: `sm__warps_active`
+34.79%, `sm__throughput` 63.54%, `dram__throughput` 11.00% — real
+utilization gains from more grid parallelism, though this kernel never
+approaches Triton v1's 95.14% `dram__throughput` at the same batch, since
+it was never bandwidth-bound to begin with.
+
+**Bank conflicts — measured, not the story this kernel's bottleneck turned
+out to be.** `l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum` is
+**0** at batch=1 (2 blocks) — the tree reduction's own addressing
+(`sdata[tid]`, `sdata[tid+s]`, contiguous stride-1 by `threadIdx.x`) is
+conflict-free by construction, structurally different from Week 0's
+`shared_stride_kernel<PAD=0>` (`tile[32][32]`, deliberately strided to hit
+the textbook 32-way conflict). At batch=64 (128 blocks), the same metric
+reads 418,325 (loads) + 100,655 (stores) — nonzero, but against
+94,371,840 load and 50,331,648 store shared-memory instructions issued at
+that batch size (both scale exactly 64x from batch=1's counts, confirming
+per-block work is unchanged), that's under 0.5% of total shared-memory
+traffic. Flagging this rather than explaining it: the conflict count
+appearing only once many blocks are concurrently resident, despite each
+block's own access pattern being unchanged and provably conflict-free in
+isolation, isn't a mechanism this investigation pinned down — worth
+re-examining if it grows in v2, where a real 2D K/V tile (indexed in a way
+that could plausibly hit a stride-32 pattern) is exactly the shared-memory
+structure Week 0's padding trick was rehearsed for. For v1, bank conflicts
+are demonstrably not the dominant cost (the stall-reason and instruction-
+count data above account for the latency without invoking them).

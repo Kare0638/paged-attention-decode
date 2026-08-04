@@ -4,7 +4,7 @@ Decode-phase attention kernel for LLM inference with paged KV cache and GQA supp
 
 ## Status
 
-Triton v1–v4 (naive, wider tiles, num_stages tuning, split-K) are implemented, tested, and benchmarked — see Results below. CUDA C++ and the A100/FlashInfer comparison are still ahead. This README gets updated with real benchmark numbers as each version ships — no numbers are reported until they're measured.
+Triton v1–v4 (naive, wider tiles, num_stages tuning, split-K) are implemented, tested, and benchmarked — see Results below. CUDA C++ v1 (naive baseline, a PyTorch extension via `torch.utils.cpp_extension`) is also implemented, tested, and benchmarked — it is deliberately more naive than Triton v1 and much slower, the starting point CUDA v2's shared-memory tiling gets measured against next. The A100/FlashInfer comparison is still ahead. This README gets updated with real benchmark numbers as each version ships — no numbers are reported until they're measured.
 
 ## Why this project
 
@@ -43,7 +43,7 @@ seq_lens:    [batch]
 - [ ] CUDA C++: explicit shared-memory tiling, bank-conflict elimination
 - [ ] CUDA C++: warp-shuffle reduction, occupancy analysis
 - [ ] CUDA C++: split-K, packaged as a PyTorch extension
-- [x] Correctness test suite for the reference implementation (page boundaries, extreme/ragged/zero-length sequences, non-contiguous block tables with unreferenced "holes", GQA ratios 1/4/6/8, full input-validation coverage, 2000-case randomized fuzz vs. an independently-written SDPA oracle) plus kernel-vs-reference suites for v1, v2, v3, and v4 (173 cases at default settings, `tests/`), including v4's split-invariance check and a bit-exact `num_splits=1`-vs-v1 equivalence test. Cross-implementation (Triton vs. CUDA) tests land once the CUDA version exists.
+- [x] Correctness test suite for the reference implementation (page boundaries, extreme/ragged/zero-length sequences, non-contiguous block tables with unreferenced "holes", GQA ratios 1/4/6/8, full input-validation coverage, 2000-case randomized fuzz vs. an independently-written SDPA oracle) plus kernel-vs-reference suites for Triton v1, v2, v3, v4, and CUDA v1 (204 cases at default settings, `tests/`), including v4's split-invariance check and a bit-exact `num_splits=1`-vs-v1 equivalence test.
 - [ ] Nsight-driven optimization log with before/after profiles
 - [ ] Benchmark against FlashInfer (A100)
 - [ ] Roofline plot using measured (not nominal) peak bandwidth
@@ -179,6 +179,48 @@ in [profiles/notes.md](profiles/notes.md);
 and [bench/results/decode_latency.json](bench/results/decode_latency.json)
 have the full data.
 
+**CUDA v1 (naive baseline)** — the first CUDA C++ kernel in this project,
+and the first kernel here built via `torch.utils.cpp_extension` (JIT)
+rather than Triton's own JIT; the pipeline itself was smoke-tested with a
+throwaway add-kernel before any real logic depended on it. A direct port
+of `_paged_attn_decode_v1_kernel`'s algorithm (same grid, same
+online-softmax recurrence) but deliberately more naive: no page-tile
+batching (token-by-token dot products via a block-wide shared-memory tree
+reduction, instead of Triton's tiled `tl.dot`) and no K/V sharing across
+the `gqa_ratio` query rows. That gap is intentional — it's the baseline
+CUDA v2's shared-memory tiling roadmap item gets measured against, the
+same role Triton v1 played for Triton v2.
+
+Correctness: same shape matrix and tolerance as Triton v1's test suite
+(`tests/test_kernel_cuda_v1.py`, 31 cases, all passing). Unlike Triton,
+CUDA has no `tl.arange` power-of-2 constraint and no `tl.dot` K>=16 floor,
+so this kernel's input validation is a genuine subset of Triton v1's.
+
+| batch | Triton v1 | CUDA v1 | CUDA v1 vs. Triton v1 |
+|---|---|---|---|
+| 1 | 0.131 ms | 6.008 ms | 0.02x (~46x slower) |
+| 16 | 0.175 ms | 6.960 ms | 0.03x (~40x slower) |
+| 64 | 0.423 ms | 13.348 ms | 0.03x (~32x slower) |
+
+NCU shows a genuinely different bottleneck than Triton v1, not the same
+one measured worse: Triton v1 is memory-latency-bound
+(`long_scoreboard` dominant). CUDA v1's dominant stall is `wait`
+(fixed-latency math-pipe, the per-token `__expf`/division calls), followed
+by `short_scoreboard` (shared-memory round trips) and `barrier`
+(`__syncthreads()`) — `long_scoreboard` is CUDA v1's *smallest* nonzero
+stall category. At batch=1, `dram__throughput` reads 0.92% (this kernel
+isn't memory-bound at all) while it issues 1.47M shared-memory load
+instructions from just 2 thread blocks — one full block-wide
+reduction-and-barrier per token per row, `gqa_ratio * seq_len` times per
+block. That instruction/sync volume, not bandwidth, is the cost v2's
+shared-memory K/V tiling is expected to amortize away. Bank conflicts
+(`l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum`) measure **0**
+at batch=1 — the reduction's own stride-1 addressing is conflict-free by
+construction, unlike Week 0's deliberately-strided test kernel — so
+bank-conflict elimination isn't fixing a v1 problem; it'll matter for the
+new 2D K/V tile layout v2 introduces. Full mechanism and the batch=64
+numbers in [profiles/notes.md](profiles/notes.md).
+
 ## Repo layout
 
 ```
@@ -200,13 +242,15 @@ RTX 3060 Laptop (6GB) on WSL2 for development; cross-hardware validation planned
 uv venv --python 3.12
 uv pip install -r requirements.txt
 
-# correctness (reference oracle + Triton v1/v2/v3/v4 kernels, needs a CUDA GPU for the kernel half)
+# correctness (reference oracle + Triton v1/v2/v3/v4 + CUDA v1 kernels, needs a CUDA GPU for the kernel half)
 uv run pytest tests/ -q
+# CUDA v1 alone (JIT-compiles cuda/*.cu on first run, cached after that)
+uv run pytest tests/test_kernel_cuda_v1.py -q
 # full 2000-case reference fuzz / 100-case kernel fuzz (defaults are fast subsets):
 PAGED_ATTN_FUZZ_ITERS=2000 uv run pytest tests/test_reference_fuzz.py -q
 PAGED_ATTN_KERNEL_FUZZ_ITERS=100 uv run pytest tests/test_kernel_v1.py::test_fuzz_curated_shape_matrix -q
 
-# latency: reference vs. Triton v1 vs. v2 vs. v3 vs. v4, batch sweep at the primary target shape
+# latency: reference vs. Triton v1 vs. v2 vs. v3 vs. v4 vs. CUDA v1, batch sweep at the primary target shape
 uv run python bench/bench_decode.py
 # v4's num_splits sweep at batch=1 (sets the wrapper's default)
 uv run python bench/bench_v4_num_splits.py

@@ -1,11 +1,17 @@
-"""Latency: fp32 reference (per-batch Python loop) vs. Triton v1/v2/v3/v4.
+"""Latency: fp32 reference (per-batch Python loop) vs. Triton v1/v2/v3/v4
+vs. CUDA C++ v1.
 
-All five run on GPU so the comparison isolates "one fused kernel over the
+All six run on GPU so the comparison isolates "one fused kernel over the
 whole batch" vs. "a Python loop issuing many small per-sequence GPU
 launches" — not a CPU-vs-GPU comparison. Each implementation runs in its
 own natural dtype (reference.py is fp32-only by design; the kernels are
 fp16), matching how each would actually be used, not an artificially
-matched dtype.
+matched dtype. cuda_v1 is deliberately more naive than Triton v1 (see
+cuda/kernel_v1_naive.cu) — token-by-token dot products with a
+shared-memory tree reduction, no page-tile batching, no K/V sharing across
+GQA rows — so it is expected to lose to every Triton version here; that's
+the honest baseline CUDA v2's shared-memory tiling gets measured against
+next, not a claim CUDA already competes with Triton.
 
 Fixed at the primary target shape (Qwen2.5-1.5B-like: GQA ratio 6, head_dim
 128, page_size 16) and a representative mid-length context (seq_len 2048),
@@ -36,6 +42,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # repo root, fo
 import torch
 
 from measure_peak_bw import _gpu_power_state  # same dir as this script; reuse the metadata helper
+from src.kernel_cuda_v1 import paged_attention_decode_cuda_v1
 from src.kernel_v1_naive import paged_attention_decode_v1
 from src.kernel_v2_coalesced import paged_attention_decode_v2
 from src.kernel_v3_online_softmax import paged_attention_decode_v3
@@ -121,9 +128,12 @@ def main() -> None:
             "v2": lambda: paged_attention_decode_v2(q_fp16, k_fp16, v_fp16, bt_cuda, sl_cuda),
             "v3": lambda: paged_attention_decode_v3(q_fp16, k_fp16, v_fp16, bt_cuda, sl_cuda),
             "v4": lambda: paged_attention_decode_v4(q_fp16, k_fp16, v_fp16, bt_cuda, sl_cuda),
+            "cuda_v1": lambda: paged_attention_decode_cuda_v1(q_fp16, k_fp16, v_fp16, bt_cuda, sl_cuda),
         }
         m = _median_of_trials(fns)
-        ref_ms, v1_ms, v2_ms, v3_ms, v4_ms = m["reference"], m["v1"], m["v2"], m["v3"], m["v4"]
+        ref_ms, v1_ms, v2_ms, v3_ms, v4_ms, cuda_v1_ms = (
+            m["reference"], m["v1"], m["v2"], m["v3"], m["v4"], m["cuda_v1"],
+        )
 
         results.append(
             {
@@ -134,19 +144,23 @@ def main() -> None:
                 "kernel_v2_ms": round(v2_ms, 4),
                 "kernel_v3_ms": round(v3_ms, 4),
                 "kernel_v4_ms": round(v4_ms, 4),
+                "kernel_cuda_v1_ms": round(cuda_v1_ms, 4),
                 "v1_speedup_vs_reference": round(ref_ms / v1_ms, 2),
                 "v2_speedup_vs_reference": round(ref_ms / v2_ms, 2),
                 "v3_speedup_vs_reference": round(ref_ms / v3_ms, 2),
                 "v4_speedup_vs_reference": round(ref_ms / v4_ms, 2),
+                "cuda_v1_speedup_vs_reference": round(ref_ms / cuda_v1_ms, 2),
                 "v2_speedup_vs_v1": round(v1_ms / v2_ms, 2),
                 "v3_speedup_vs_v2": round(v2_ms / v3_ms, 2),
                 "v4_speedup_vs_v1": round(v1_ms / v4_ms, 2),
+                "cuda_v1_speedup_vs_triton_v1": round(v1_ms / cuda_v1_ms, 2),
             }
         )
         print(
             f"batch={batch:3d}: reference {ref_ms:9.4f} ms | v1 {v1_ms:8.4f} ms | "
             f"v2 {v2_ms:8.4f} ms | v3 {v3_ms:8.4f} ms | v4 {v4_ms:8.4f} ms | "
-            f"v4 vs v1 {v1_ms / v4_ms:5.2f}x | v4 vs reference {ref_ms / v4_ms:6.1f}x"
+            f"cuda_v1 {cuda_v1_ms:9.4f} ms | v4 vs v1 {v1_ms / v4_ms:5.2f}x | "
+            f"cuda_v1 vs v1 {v1_ms / cuda_v1_ms:5.2f}x"
         )
 
     record = {
@@ -170,7 +184,11 @@ def main() -> None:
         "implementation in its natural/enforced dtype. v2/v3/v4 use block_n=128 "
         "(v1 has no block_n knob; its tile is fixed to page_size); v3 additionally "
         "pins num_stages=4; v4 uses num_splits=16 (from bench_v4_num_splits.py's "
-        "sweep at batch=1).",
+        "sweep at batch=1). cuda_v1 is a raw CUDA C++ extension (torch.utils."
+        "cpp_extension JIT), grid=(batch, num_kv_heads) same as Triton v1 but "
+        "token-by-token dot products with a shared-memory tree reduction and no "
+        "K/V sharing across GQA rows (see cuda/kernel_v1_naive.cu) — a deliberately "
+        "more naive baseline than Triton v1, not a tuned competitor.",
     }
 
     out_path = Path(__file__).parent / "results" / "decode_latency.json"
