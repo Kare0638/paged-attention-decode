@@ -686,3 +686,88 @@ methodology artifact (checked from three angles: raw wall-clock time,
 NCU-measured kernel duration, and instruction/stall-reason counts, all
 agreeing). The actual bottleneck this kernel needs fixed is
 dependency-chain length, which is v3's job.
+
+## CUDA v3 — warp-shuffle reduction (2026-08-04)
+
+`cuda/kernel_v3_warp_shuffle.cu` replaces v1/v2's tree-reduction-plus-
+`__syncthreads()` algorithm with warp-shuffle (`__shfl_down_sync`/
+`__shfl_sync`) — a genuinely different reduction algorithm, not another
+grouping of the same one (that was v2's already-tested lever). No shared
+memory, no explicit block-wide barrier at all: reduction happens in
+registers via warp-synchronous shuffle instructions. Forces `blockDim(32)`
+(one warp per block) instead of v1/v2's `blockDim(head_dim)`, so each
+thread now owns `head_dim/32` lanes — a genuine new precondition
+(`head_dim % 32 == 0`) specific to this design, satisfied by both
+head_dim values (32, 128) this project's CUDA test suite exercises.
+
+**Correctness**: `tests/test_kernel_cuda_v3.py`, 32 cases, all passing.
+v1-vs-v3 comparison (different floating-point reduction order, not
+expected to be bit-exact like v2 was): measured max diff **~6e-8** at the
+exact test shape (both kernels accumulate in fp32 throughout, rounding to
+fp16 only once at the final store, so the reordering barely matters in
+practice) — `rtol=1e-4/atol=1e-5` set from that measurement, not guessed.
+
+**This time the hypothesis holds — a real, measured win**, not another
+null result. `bench_decode.py`: `cuda_v3` vs. `cuda_v1` is 1.34x-2.00x
+across every batch size, growing with batch:
+
+| batch | cuda_v1 | cuda_v3 | cuda_v3 vs. cuda_v1 |
+|---|---|---|---|
+| 1 | 5.877 ms | 4.287 ms | 1.37x |
+| 16 | 6.865 ms | 4.746 ms | 1.45x |
+| 64 | 11.558 ms | 5.791 ms | 2.00x |
+
+NCU confirms the mechanism directly, with a result more nuanced than
+either of the plan's two hypotheses predicted in isolation:
+
+| metric | v1, batch=1 | v3, batch=1 | v1, batch=64 | v3, batch=64 |
+|---|---|---|---|---|
+| `gpu__time_duration.sum` | 8.79 ms | 6.54 ms | 14.82 ms | 7.68 ms |
+| `smsp__inst_executed.sum` | 11,635,480 | **2,746,770** | 744,670,720 | **175,793,280** |
+| `launch__occupancy_limit_registers` | 12 blocks | **48 blocks** | 12 blocks | **48 blocks** |
+| `launch__occupancy_limit_blocks` (hardware max) | 16 | 16 | 16 | 16 |
+| `sm__warps_active` | 8.33% | **2.08%** | 34.80% | **8.81%** |
+| bank conflicts (ld/st) | 0 | 0 | (not re-measured) | 0 |
+
+**Hypothesis 1 (shorter critical path -> lower latency at every batch)
+confirmed cleanly**: instruction count drops ~4.2x at *both* batch sizes
+(a consistent ratio, not batch-dependent) — no shared-memory traffic at
+all, and the reduction itself collapses from 9 sequentially-dependent
+`__syncthreads()`-bound stages to 6 dependent shuffle instructions. This
+alone explains the latency win at batch=1, where grid size (2 blocks,
+unchanged from v1/v2) rules out an occupancy-driven explanation.
+
+**Hypothesis 2 (occupancy) was directionally right but not in the way
+predicted.** `launch__occupancy_limit_registers` jumps from 12 to 48
+blocks/SM — a clean 4x, matching the 4x reduction in threads/block
+(128->32) at roughly the same per-thread register footprint — so v3 is
+no longer register-bound; the hardware's fixed 16-blocks/SM ceiling
+becomes the binding constraint instead (up from register-bound 12, a
+real ~33% increase in the *ceiling*). But **achieved occupancy
+(`sm__warps_active`) is *lower* for v3 than v1 at both batch sizes**, not
+higher — 2.08% vs. 8.33% at batch=1, 8.81% vs. 34.80% at batch=64 —
+because each resident block now contributes only 1 warp instead of 4, so
+even with more blocks fitting per SM, total resident warps/SM drops.
+**v3 is faster with strictly lower measured occupancy at every batch
+tested** — the same "achieved occupancy isn't the whole performance
+story" lesson already documented for Triton v4's phase 1, now confirmed
+again from the opposite direction (lower occupancy, still faster,
+instead of flat occupancy, still faster). The growing speedup with batch
+(1.37x -> 2.00x) is plausibly explained by more of v3's smaller blocks
+fitting concurrently as grid size grows (16-block ceiling vs. v1's
+12-block ceiling) stacking on top of the batch-independent instruction-
+count win — a reasonable reading of the data, not independently isolated
+beyond what's shown here.
+
+**Bank conflicts**: 0 at both batch=1 and batch=64 — consistent with
+having no shared memory at all in this kernel, so there is nothing for
+Week 0's padding technique to apply to.
+
+**Bottom line**: unlike v2, this is a genuine, mechanistically-understood
+win — changing the reduction *algorithm* (not just its grouping)
+shortened the actual dependency chain, exactly the fix CUDA v2's
+investigation called for. The occupancy story is real but not the one
+originally guessed: the *ceiling* rose (register pressure relieved), but
+*achieved* occupancy fell (fewer warps per block) — both true at once,
+and the latency win traces mainly to the shorter critical path, not to
+higher occupancy.

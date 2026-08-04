@@ -16,6 +16,7 @@ _CUDA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file_
 _SOURCES = [
     "kernel_v1_naive.cu",
     "kernel_v2_shared_tile.cu",
+    "kernel_v3_warp_shuffle.cu",
     "binding.cpp",
 ]
 

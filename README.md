@@ -4,7 +4,7 @@ Decode-phase attention kernel for LLM inference with paged KV cache and GQA supp
 
 ## Status
 
-Triton v1–v4 (naive, wider tiles, num_stages tuning, split-K) are implemented, tested, and benchmarked — see Results below. CUDA C++ v1 (naive baseline) and v2 (batched shared-memory reduction, both as `torch.utils.cpp_extension` extensions) are also implemented, tested, and benchmarked — v2 correctly implements shared-memory tiling and bank-conflict elimination but landed as a null result on latency, honestly reported rather than adjusted; the real fix is v3's warp-shuffle reduction, next up. The A100/FlashInfer comparison is still ahead. This README gets updated with real benchmark numbers as each version ships — no numbers are reported until they're measured.
+Triton v1–v4 (naive, wider tiles, num_stages tuning, split-K) are implemented, tested, and benchmarked — see Results below. CUDA C++ v1 (naive baseline), v2 (batched shared-memory reduction), and v3 (warp-shuffle reduction, all as `torch.utils.cpp_extension` extensions) are also implemented, tested, and benchmarked — v2 landed as a null result on latency (honestly reported rather than adjusted); v3 changed the reduction algorithm itself instead of just its grouping and is a real, mechanistically-understood 1.37x-2.00x win over CUDA v1. Next up is CUDA v4 (split-K, packaged as a PyTorch extension). The A100/FlashInfer comparison is still ahead. This README gets updated with real benchmark numbers as each version ships — no numbers are reported until they're measured.
 
 ## Why this project
 
@@ -41,9 +41,9 @@ seq_lens:    [batch]
 - [x] Triton v3: single-pass online softmax — already true of v1/v2's design (the running-softmax loop is structurally required at real seq_len, not a separate feature). `src/kernel_v3_online_softmax.py` formalizes the one thing left to try, an explicit `num_stages=4` pin (Triton's own default is 3, confirmed from the installed 3.6.0 source), but a real A/B through the wrapper shows it within noise of v2's default at 6 of 7 batch sizes — reported as "checked, marginal at best," not inflated into a claimed win. Investigating it surfaced a bigger, unrelated finding: both v1/v2's wrappers had an `assert` on a GPU tensor's value that forced a device-to-host sync, costing 2-3x the raw kernel latency at batch=1 — fixed, and every latency number below reflects the fix.
 - [x] Triton v4: split-K along the sequence dimension — real win at low batch (1.83x vs. v1 at batch=1), real loss at high batch (0.75x-0.85x at 32/64), same tradeoff shape as v2, reported in both directions — see Results below
 - [x] CUDA C++: explicit shared-memory tiling, bank-conflict elimination — `cuda/kernel_v2_shared_tile.cu` batches the score reduction across all GQA rows into one shared-memory tile per token instead of one reduction per row; correctness verified (bit-exact vs. CUDA v1), instruction count and shared-memory traffic both measurably lower, but **no latency win** (0.98x-1.04x vs. CUDA v1, noise-level) — the kernel is latency-bound by dependency-chain length, not instruction count, so cutting sync-call count without shortening the chain doesn't help. Bank-conflict elimination checked via a genuine padded-vs-unpadded A/B, not assumed: 0 conflicts in both — see Results below
-- [ ] CUDA C++: warp-shuffle reduction, occupancy analysis
+- [x] CUDA C++: warp-shuffle reduction, occupancy analysis — `cuda/kernel_v3_warp_shuffle.cu` replaces the tree-reduction-plus-`__syncthreads()` algorithm with warp-shuffle (one warp per block instead of one block spanning head_dim), a real, mechanistically-understood win this time: **1.37x-2.00x vs. CUDA v1**, growing with batch, from a ~4.2x drop in total instructions (no shared memory at all). Occupancy story is more nuanced than "more warp-shuffle = more occupancy": the register-bound ceiling rises 12→48 blocks/SM, but *achieved* occupancy (`sm__warps_active`) is actually lower than v1 at every batch tested (2.08% vs. 8.33% at batch=1) since each block now carries 1 warp instead of 4 — the speedup traces to the shorter dependency chain, not higher occupancy — see Results below
 - [ ] CUDA C++: split-K, packaged as a PyTorch extension
-- [x] Correctness test suite for the reference implementation (page boundaries, extreme/ragged/zero-length sequences, non-contiguous block tables with unreferenced "holes", GQA ratios 1/4/6/8, full input-validation coverage, 2000-case randomized fuzz vs. an independently-written SDPA oracle) plus kernel-vs-reference suites for Triton v1, v2, v3, v4, and CUDA v1, v2 (236 cases at default settings, `tests/`), including v4's split-invariance check, a bit-exact `num_splits=1`-vs-v1 equivalence test, and a bit-exact CUDA v1-vs-v2 equivalence test.
+- [x] Correctness test suite for the reference implementation (page boundaries, extreme/ragged/zero-length sequences, non-contiguous block tables with unreferenced "holes", GQA ratios 1/4/6/8, full input-validation coverage, 2000-case randomized fuzz vs. an independently-written SDPA oracle) plus kernel-vs-reference suites for Triton v1, v2, v3, v4, and CUDA v1, v2, v3 (268 cases at default settings, `tests/`), including v4's split-invariance check, a bit-exact `num_splits=1`-vs-v1 equivalence test, a bit-exact CUDA v1-vs-v2 equivalence test, and a close (~6e-8 max diff) CUDA v1-vs-v3 equivalence test.
 - [ ] Nsight-driven optimization log with before/after profiles
 - [ ] Benchmark against FlashInfer (A100)
 - [ ] Roofline plot using measured (not nominal) peak bandwidth
@@ -272,6 +272,55 @@ different reduction algorithm, not just a different grouping of the same
 tree reduction) targets next. Full data in
 [profiles/notes.md](profiles/notes.md).
 
+**CUDA v3 (warp-shuffle reduction)** — replaces v1/v2's tree-reduction-
+plus-`__syncthreads()` algorithm with warp-shuffle (`__shfl_down_sync`/
+`__shfl_sync`): no shared memory, no explicit block-wide barrier at all,
+reduction happens in registers via warp-synchronous shuffle instructions.
+Forces one warp per block (`blockDim=32`) instead of v1/v2's
+`blockDim=head_dim`, so each thread now owns `head_dim/32` lanes — a new,
+honestly-documented precondition (`head_dim % 32 == 0`) specific to this
+design, satisfied by both head_dim values (32, 128) this project's CUDA
+test suite exercises.
+
+Correctness: 32 cases pass (`tests/test_kernel_cuda_v3.py`). v1-vs-v3
+comparison (different floating-point reduction order, not bit-exact like
+v2 was): measured max diff ~6e-8 — `rtol=1e-4/atol=1e-5` set from that
+measurement, not guessed.
+
+**This time the hypothesis holds — a real, mechanistically-understood
+win, not another null result:**
+
+| batch | CUDA v1 | CUDA v3 | CUDA v3 vs. CUDA v1 |
+|---|---|---|---|
+| 1 | 5.877 ms | 4.287 ms | 1.37x |
+| 16 | 6.865 ms | 4.746 ms | 1.45x |
+| 64 | 11.558 ms | 5.791 ms | 2.00x |
+
+NCU shows why, with a result more nuanced than either half of the
+hypothesis predicted alone. Instruction count drops ~4.2x at *both*
+batch=1 and batch=64 (`smsp__inst_executed.sum`) — a consistent ratio,
+confirming the shorter-critical-path hypothesis independent of grid size
+(batch=1's grid is still just 2 blocks, unchanged from v1/v2, ruling out
+an occupancy-driven explanation there). The occupancy story is real but
+not the one guessed: `launch__occupancy_limit_registers` jumps 12→48
+blocks/SM (register pressure relieved by 4x fewer threads/block), so the
+hardware's fixed 16-blocks/SM ceiling becomes binding instead — a real
+~33% ceiling increase — but **achieved occupancy
+(`sm__warps_active`) is *lower* for v3 than v1 at every batch tested**
+(2.08% vs. 8.33% at batch=1; 8.81% vs. 34.80% at batch=64), since each
+resident block now carries only 1 warp instead of 4. v3 is faster with
+strictly lower measured occupancy at every batch size — the same
+"achieved occupancy isn't the whole story" lesson already documented for
+Triton v4's phase 1, confirmed again from the opposite direction. The
+speedup traces mainly to the shorter dependency chain, not to higher
+occupancy; the growing margin with batch (1.37x→2.00x) is plausibly more
+of v3's smaller blocks fitting concurrently as grid size grows, stacking
+on the batch-independent instruction-count win — a reasonable reading of
+the data, not independently isolated beyond what's shown here. Bank
+conflicts: 0 at both batches — there's no shared memory left in this
+kernel for Week 0's padding technique to apply to. Full data in
+[profiles/notes.md](profiles/notes.md).
+
 ## Repo layout
 
 ```
@@ -293,15 +342,15 @@ RTX 3060 Laptop (6GB) on WSL2 for development; cross-hardware validation planned
 uv venv --python 3.12
 uv pip install -r requirements.txt
 
-# correctness (reference oracle + Triton v1/v2/v3/v4 + CUDA v1/v2 kernels, needs a CUDA GPU for the kernel half)
+# correctness (reference oracle + Triton v1/v2/v3/v4 + CUDA v1/v2/v3 kernels, needs a CUDA GPU for the kernel half)
 uv run pytest tests/ -q
 # CUDA kernels alone (JIT-compiles cuda/*.cu on first run, cached after that)
-uv run pytest tests/test_kernel_cuda_v1.py tests/test_kernel_cuda_v2.py -q
+uv run pytest tests/test_kernel_cuda_v1.py tests/test_kernel_cuda_v2.py tests/test_kernel_cuda_v3.py -q
 # full 2000-case reference fuzz / 100-case kernel fuzz (defaults are fast subsets):
 PAGED_ATTN_FUZZ_ITERS=2000 uv run pytest tests/test_reference_fuzz.py -q
 PAGED_ATTN_KERNEL_FUZZ_ITERS=100 uv run pytest tests/test_kernel_v1.py::test_fuzz_curated_shape_matrix -q
 
-# latency: reference vs. Triton v1 vs. v2 vs. v3 vs. v4 vs. CUDA v1 vs. CUDA v2, batch sweep at the primary target shape
+# latency: reference vs. Triton v1 vs. v2 vs. v3 vs. v4 vs. CUDA v1 vs. v2 vs. v3, batch sweep at the primary target shape
 uv run python bench/bench_decode.py
 # v4's num_splits sweep at batch=1 (sets the wrapper's default)
 uv run python bench/bench_v4_num_splits.py

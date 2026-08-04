@@ -40,3 +40,16 @@ torch::Tensor paged_attn_decode_cuda_v2_unpadded_launch(
     int64_t gqa_ratio,
     int64_t head_dim,
     int64_t page_size);
+
+// v3: warp-shuffle reduction, one warp per block. Defined in
+// kernel_v3_warp_shuffle.cu.
+torch::Tensor paged_attn_decode_cuda_v3_launch(
+    torch::Tensor q,
+    torch::Tensor k_cache,
+    torch::Tensor v_cache,
+    torch::Tensor block_table,
+    torch::Tensor seq_lens,
+    double scale,
+    int64_t gqa_ratio,
+    int64_t head_dim,
+    int64_t page_size);

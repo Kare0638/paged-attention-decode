@@ -1,7 +1,7 @@
 """Latency: fp32 reference (per-batch Python loop) vs. Triton v1/v2/v3/v4
-vs. CUDA C++ v1/v2.
+vs. CUDA C++ v1/v2/v3.
 
-All seven run on GPU so the comparison isolates "one fused kernel over the
+All eight run on GPU so the comparison isolates "one fused kernel over the
 whole batch" vs. "a Python loop issuing many small per-sequence GPU
 launches" — not a CPU-vs-GPU comparison. Each implementation runs in its
 own natural dtype (reference.py is fp32-only by design; the kernels are
@@ -12,7 +12,11 @@ its own independent block-wide shared-memory tree reduction instead of
 one reduction batched across all GQA rows — so it is expected to lose to
 every Triton version here; that's the honest baseline cuda_v2 (batched
 shared-memory reduction across GQA rows, see cuda/kernel_v2_shared_tile.cu)
-is measured against, not a claim CUDA already competes with Triton.
+is measured against — a null result on latency (see profiles/notes.md).
+cuda_v3 (warp-shuffle reduction, one warp per block, see
+cuda/kernel_v3_warp_shuffle.cu) replaces the reduction algorithm itself
+rather than reorganizing the same one, the direct follow-up to that
+finding.
 
 Fixed at the primary target shape (Qwen2.5-1.5B-like: GQA ratio 6, head_dim
 128, page_size 16) and a representative mid-length context (seq_len 2048),
@@ -45,6 +49,7 @@ import torch
 from measure_peak_bw import _gpu_power_state  # same dir as this script; reuse the metadata helper
 from src.kernel_cuda_v1 import paged_attention_decode_cuda_v1
 from src.kernel_cuda_v2 import paged_attention_decode_cuda_v2
+from src.kernel_cuda_v3 import paged_attention_decode_cuda_v3
 from src.kernel_v1_naive import paged_attention_decode_v1
 from src.kernel_v2_coalesced import paged_attention_decode_v2
 from src.kernel_v3_online_softmax import paged_attention_decode_v3
@@ -132,10 +137,11 @@ def main() -> None:
             "v4": lambda: paged_attention_decode_v4(q_fp16, k_fp16, v_fp16, bt_cuda, sl_cuda),
             "cuda_v1": lambda: paged_attention_decode_cuda_v1(q_fp16, k_fp16, v_fp16, bt_cuda, sl_cuda),
             "cuda_v2": lambda: paged_attention_decode_cuda_v2(q_fp16, k_fp16, v_fp16, bt_cuda, sl_cuda),
+            "cuda_v3": lambda: paged_attention_decode_cuda_v3(q_fp16, k_fp16, v_fp16, bt_cuda, sl_cuda),
         }
         m = _median_of_trials(fns)
-        ref_ms, v1_ms, v2_ms, v3_ms, v4_ms, cuda_v1_ms, cuda_v2_ms = (
-            m["reference"], m["v1"], m["v2"], m["v3"], m["v4"], m["cuda_v1"], m["cuda_v2"],
+        ref_ms, v1_ms, v2_ms, v3_ms, v4_ms, cuda_v1_ms, cuda_v2_ms, cuda_v3_ms = (
+            m["reference"], m["v1"], m["v2"], m["v3"], m["v4"], m["cuda_v1"], m["cuda_v2"], m["cuda_v3"],
         )
 
         results.append(
@@ -149,26 +155,32 @@ def main() -> None:
                 "kernel_v4_ms": round(v4_ms, 4),
                 "kernel_cuda_v1_ms": round(cuda_v1_ms, 4),
                 "kernel_cuda_v2_ms": round(cuda_v2_ms, 4),
+                "kernel_cuda_v3_ms": round(cuda_v3_ms, 4),
                 "v1_speedup_vs_reference": round(ref_ms / v1_ms, 2),
                 "v2_speedup_vs_reference": round(ref_ms / v2_ms, 2),
                 "v3_speedup_vs_reference": round(ref_ms / v3_ms, 2),
                 "v4_speedup_vs_reference": round(ref_ms / v4_ms, 2),
                 "cuda_v1_speedup_vs_reference": round(ref_ms / cuda_v1_ms, 2),
                 "cuda_v2_speedup_vs_reference": round(ref_ms / cuda_v2_ms, 2),
+                "cuda_v3_speedup_vs_reference": round(ref_ms / cuda_v3_ms, 2),
                 "v2_speedup_vs_v1": round(v1_ms / v2_ms, 2),
                 "v3_speedup_vs_v2": round(v2_ms / v3_ms, 2),
                 "v4_speedup_vs_v1": round(v1_ms / v4_ms, 2),
                 "cuda_v1_speedup_vs_triton_v1": round(v1_ms / cuda_v1_ms, 2),
                 "cuda_v2_speedup_vs_cuda_v1": round(cuda_v1_ms / cuda_v2_ms, 2),
                 "cuda_v2_speedup_vs_triton_v1": round(v1_ms / cuda_v2_ms, 2),
+                "cuda_v3_speedup_vs_cuda_v1": round(cuda_v1_ms / cuda_v3_ms, 2),
+                "cuda_v3_speedup_vs_cuda_v2": round(cuda_v2_ms / cuda_v3_ms, 2),
+                "cuda_v3_speedup_vs_triton_v1": round(v1_ms / cuda_v3_ms, 2),
             }
         )
         print(
             f"batch={batch:3d}: reference {ref_ms:9.4f} ms | v1 {v1_ms:8.4f} ms | "
             f"v2 {v2_ms:8.4f} ms | v3 {v3_ms:8.4f} ms | v4 {v4_ms:8.4f} ms | "
             f"cuda_v1 {cuda_v1_ms:9.4f} ms | cuda_v2 {cuda_v2_ms:9.4f} ms | "
-            f"v4 vs v1 {v1_ms / v4_ms:5.2f}x | cuda_v2 vs cuda_v1 {cuda_v1_ms / cuda_v2_ms:5.2f}x | "
-            f"cuda_v2 vs v1 {v1_ms / cuda_v2_ms:5.2f}x"
+            f"cuda_v3 {cuda_v3_ms:9.4f} ms | v4 vs v1 {v1_ms / v4_ms:5.2f}x | "
+            f"cuda_v3 vs cuda_v1 {cuda_v1_ms / cuda_v3_ms:5.2f}x | "
+            f"cuda_v3 vs v1 {v1_ms / cuda_v3_ms:5.2f}x"
         )
 
     record = {
@@ -199,7 +211,10 @@ def main() -> None:
         "a deliberately more naive baseline than Triton v1, not a tuned competitor. "
         "cuda_v2 batches that reduction across all GQA rows into one shared-memory "
         "tile per token instead of one reduction per row (see "
-        "cuda/kernel_v2_shared_tile.cu), the padded (production) variant.",
+        "cuda/kernel_v2_shared_tile.cu), the padded (production) variant. cuda_v3 "
+        "replaces the reduction algorithm itself with warp-shuffle, one warp per "
+        "block (blockDim=32) instead of v1/v2's blockDim=head_dim (see "
+        "cuda/kernel_v3_warp_shuffle.cu).",
     }
 
     out_path = Path(__file__).parent / "results" / "decode_latency.json"
