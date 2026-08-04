@@ -12,10 +12,15 @@
  *    loop iteration via `tl.dot`. This kernel loops token-by-token — no
  *    tiled matmul, one dot product (a full block-wide reduction) per
  *    (row, token) pair.
- *  - Every one of the `gqa_ratio` query rows independently re-reads the
- *    same K/V values from global memory (no sharing across rows). v2's
- *    roadmap item — cooperative shared-memory K/V tiling — is specifically
- *    what removes this redundancy; it does not exist yet here on purpose.
+ *  - K/V *is* already loaded once per token into a register and reused
+ *    across all `gqa_ratio` rows below (see `k_val`/`v_val`, loaded once
+ *    per `n` outside the `for row` loop) — there is no redundant global
+ *    re-read to fix. The real per-row-repeated cost is the *reduction*:
+ *    each row runs its own independent block-wide tree reduction (9
+ *    `__syncthreads()` calls at head_dim=128), `gqa_ratio` times per
+ *    token, instead of one reduction handling all rows at once. That's
+ *    what v2's shared-memory tiling batches away — see
+ *    cuda/kernel_v2_shared_tile.cu.
  *
  * Grid is `(batch, num_kv_heads)`, identical to Triton v1's, so the
  * occupancy story (2 thread blocks at batch=1 on this ~28-SM GPU) is

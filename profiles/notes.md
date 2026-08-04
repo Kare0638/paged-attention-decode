@@ -497,12 +497,15 @@ algorithm (same grid, `(batch, num_kv_heads)`; same online-softmax
 recurrence), but deliberately **more naive** than Triton v1: no page-tile
 batching (Triton's `tl.dot` computes a whole `[GQA_RATIO_PADDED, BLOCK_N]`
 score tile per iteration via one matmul instruction; this kernel loops
-token-by-token, one block-wide reduction per `(row, token)` pair) and no
-K/V sharing across the `gqa_ratio` rows (each row redundantly re-reads the
-same K/V values from global memory). That gap is intentional — v2's
-"shared-memory tiling" roadmap item is specifically what removes it, and
-needs a naive baseline to be measured against, the same role Triton v1
-played for Triton v2's tile-size change.
+token-by-token, one block-wide reduction per `(row, token)` pair). K/V
+*is* already loaded once per token into a register and reused across all
+`gqa_ratio` rows — no redundant global re-read to fix there. The real
+per-row-repeated cost is the reduction itself: each row runs its own
+independent 9-`__syncthreads()` tree reduction, `gqa_ratio` times per
+token, instead of one reduction batched across all rows at once. That's
+intentional — v2's "shared-memory tiling" roadmap item is specifically
+what batches it away, and needs a naive baseline to be measured against,
+the same role Triton v1 played for Triton v2's tile-size change.
 
 **Correctness**: `tests/test_kernel_cuda_v1.py` mirrors
 `tests/test_kernel_v1.py`'s shape matrix exactly (same tolerance,
@@ -581,8 +584,105 @@ traffic. Flagging this rather than explaining it: the conflict count
 appearing only once many blocks are concurrently resident, despite each
 block's own access pattern being unchanged and provably conflict-free in
 isolation, isn't a mechanism this investigation pinned down — worth
-re-examining if it grows in v2, where a real 2D K/V tile (indexed in a way
-that could plausibly hit a stride-32 pattern) is exactly the shared-memory
-structure Week 0's padding trick was rehearsed for. For v1, bank conflicts
+re-examining in v2, whose `[gqa_ratio][head_dim]` shared-memory tile is
+the next structure to check with Week 0's padding trick, though the same
+structural reason (threadIdx.x is always the head_dim lane; row/token
+indices are always looped serially within a thread, never spread across
+a warp) predicts it won't matter there either — v2 measures a padded and
+unpadded variant directly rather than assuming either outcome. For v1, bank conflicts
 are demonstrably not the dominant cost (the stall-reason and instruction-
 count data above account for the latency without invoking them).
+
+## CUDA v2 — batched shared-memory reduction (2026-08-04)
+
+`cuda/kernel_v2_shared_tile.cu` batches the score reduction across all
+`gqa_ratio` query rows into one `[gqa_ratio][row_stride]` shared-memory
+tile per token, instead of v1's one independent block-wide tree reduction
+per `(row, token)` pair. Hypothesis going in: since v1 runs a full
+9-`__syncthreads()` reduction sequence `gqa_ratio` times per token, and
+NCU's v1 profile showed `barrier` as a top-3 stall category, batching all
+rows into every reduction stage should cut `__syncthreads()` call count
+from `gqa_ratio * seq_len * 9` to `seq_len * 9` — an exact 6x reduction
+at the primary shape — and reduce latency accordingly.
+
+**Correctness**: `tests/test_kernel_cuda_v2.py` mirrors v1's full shape
+matrix (32 cases, all passing) plus a direct v1-vs-v2 comparison at
+`rtol=1e-4/atol=1e-5` — **max diff 0.0** (bit-exact), confirming v2 is a
+pure reassociation of v1's math, not a different algorithm.
+
+**The hypothesis was wrong.** `bench_decode.py`: `cuda_v2` vs. `cuda_v1`
+is 0.98x–1.04x across every batch size (1 through 64) — noise-level, no
+systematic win in either direction, despite the reduction being real and
+measured:
+
+| metric (batch=1) | CUDA v1 | CUDA v2 (padded) |
+|---|---|---|
+| `gpu__time_duration.sum` | 8.79 ms | 8.85 ms |
+| `smsp__inst_executed.sum` (total instructions) | 11,635,480 | 9,181,968 (-21%) |
+| `smsp__inst_executed_op_shared_ld.sum` | 1,474,560 | 573,440 (-61%) |
+| `smsp__inst_executed_op_shared_st.sum` | 786,432 | 344,064 (-56%) |
+
+v2 genuinely executes far fewer instructions and far less shared-memory
+traffic — and it makes **no measurable difference to wall-clock time**.
+The stall-reason ratios explain why:
+`smsp__average_warp_latency_issue_stalled_barrier.ratio` is **higher** in
+v2 (4,782,348) than v1 (2,363,041) — the opposite of the predicted
+direction — while `short_scoreboard` drops (891,689 vs. 2,730,034) and
+`wait` drops modestly (2,771,659 vs. 3,967,707). Reducing the *count* of
+`__syncthreads()` calls doesn't reduce the *total time* spent
+synchronizing when each remaining barrier now waits on 6x more serialized
+work (the `for row` loop moved inside each reduction stage) before it can
+release — fewer, longer barrier waits instead of more, shorter ones,
+netting out to roughly the same total stall time. Both `sm__throughput`
+(0.78%) and `dram__throughput` (0.85%) stay near-zero at batch=1 in v2,
+same as v1 — this kernel is latency-bound by the length of its serialized
+dependency chain (compute → shared write → sync → shared read →
+compute...), not by instruction throughput or bandwidth, so cutting
+instruction *count* without shortening that chain's *length* (still 9
+sequentially-dependent stages per token, same as v1 — only the width of
+each stage changed) doesn't move the needle. This is the real,
+evidence-backed case for v3's warp-shuffle reduction: it's not just
+"another way to reduce," it changes the dependency-chain structure
+itself, which this version's data shows is the actual lever, not sync
+count or instruction volume.
+
+**Bank-conflict A/B**: `forward_v2` (padded, `row_stride = head_dim + 1`)
+vs. `forward_v2_unpadded` (`row_stride = head_dim`), both templated off
+the same kernel (`PAD` bool, reusing Week 0's `shared_stride_kernel<PAD>`
+technique). At batch=64:
+
+| metric | padded | unpadded |
+|---|---|---|
+| `gpu__time_duration.sum` | 13.74 ms | 13.56 ms |
+| `l1tex__data_bank_conflicts_..._ld.sum` | 0 | 0 |
+| `l1tex__data_bank_conflicts_..._st.sum` | 0 | 0 |
+| `dram__throughput` | 36.68% | 37.38% |
+| `sm__warps_active` | 35.04% | 35.05% |
+
+The prediction from v1's analysis holds: **0 conflicts in both variants**,
+no measurable latency difference — `threadIdx.x` is still always the
+head_dim lane in this tile, and `row`/`token` are still always looped
+serially within a thread, never spread across a warp's lanes on one
+instruction, so the padding has nothing to fix. Unlike v1 (which measured
+a small, unexplained nonzero conflict count at batch=64 specifically),
+v2's `[gqa_ratio][head_dim]` tile shows exactly 0 at batch=64 in *both*
+variants — that anomaly does not reproduce under this differently-shaped
+tile, consistent with it being specific to v1's flat-array structure
+rather than a general "many resident blocks" effect.
+
+**Occupancy**: `launch__occupancy_limit_shared_mem` drops from v1's 21
+blocks/SM to v2's 15 (the wider tile costs more shared memory, as
+expected) but `launch__occupancy_limit_registers` stays at 12 in both —
+registers, not shared memory, remain the binding ceiling, so this change
+costs nothing in occupancy, unlike Triton v2's real 8-to-1 blocks/SM
+regression.
+
+**Bottom line, reported as measured**: the "shared-memory tiling"
+roadmap item is implemented and verified correct, and bank-conflict
+elimination was checked directly (via a real padded/unpadded A/B, not
+assumed) and confirmed unnecessary for this access pattern. It is *not* a
+latency win — a genuine null result, not a hidden regression or a
+methodology artifact (checked from three angles: raw wall-clock time,
+NCU-measured kernel duration, and instruction/stall-reason counts, all
+agreeing). The actual bottleneck this kernel needs fixed is
+dependency-chain length, which is v3's job.

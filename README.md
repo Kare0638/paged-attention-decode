@@ -4,7 +4,7 @@ Decode-phase attention kernel for LLM inference with paged KV cache and GQA supp
 
 ## Status
 
-Triton v1–v4 (naive, wider tiles, num_stages tuning, split-K) are implemented, tested, and benchmarked — see Results below. CUDA C++ v1 (naive baseline, a PyTorch extension via `torch.utils.cpp_extension`) is also implemented, tested, and benchmarked — it is deliberately more naive than Triton v1 and much slower, the starting point CUDA v2's shared-memory tiling gets measured against next. The A100/FlashInfer comparison is still ahead. This README gets updated with real benchmark numbers as each version ships — no numbers are reported until they're measured.
+Triton v1–v4 (naive, wider tiles, num_stages tuning, split-K) are implemented, tested, and benchmarked — see Results below. CUDA C++ v1 (naive baseline) and v2 (batched shared-memory reduction, both as `torch.utils.cpp_extension` extensions) are also implemented, tested, and benchmarked — v2 correctly implements shared-memory tiling and bank-conflict elimination but landed as a null result on latency, honestly reported rather than adjusted; the real fix is v3's warp-shuffle reduction, next up. The A100/FlashInfer comparison is still ahead. This README gets updated with real benchmark numbers as each version ships — no numbers are reported until they're measured.
 
 ## Why this project
 
@@ -40,10 +40,10 @@ seq_lens:    [batch]
 - [x] Triton v2: wider tiles (decoupled from page_size) — see Results below; not a strict win over v1
 - [x] Triton v3: single-pass online softmax — already true of v1/v2's design (the running-softmax loop is structurally required at real seq_len, not a separate feature). `src/kernel_v3_online_softmax.py` formalizes the one thing left to try, an explicit `num_stages=4` pin (Triton's own default is 3, confirmed from the installed 3.6.0 source), but a real A/B through the wrapper shows it within noise of v2's default at 6 of 7 batch sizes — reported as "checked, marginal at best," not inflated into a claimed win. Investigating it surfaced a bigger, unrelated finding: both v1/v2's wrappers had an `assert` on a GPU tensor's value that forced a device-to-host sync, costing 2-3x the raw kernel latency at batch=1 — fixed, and every latency number below reflects the fix.
 - [x] Triton v4: split-K along the sequence dimension — real win at low batch (1.83x vs. v1 at batch=1), real loss at high batch (0.75x-0.85x at 32/64), same tradeoff shape as v2, reported in both directions — see Results below
-- [ ] CUDA C++: explicit shared-memory tiling, bank-conflict elimination
+- [x] CUDA C++: explicit shared-memory tiling, bank-conflict elimination — `cuda/kernel_v2_shared_tile.cu` batches the score reduction across all GQA rows into one shared-memory tile per token instead of one reduction per row; correctness verified (bit-exact vs. CUDA v1), instruction count and shared-memory traffic both measurably lower, but **no latency win** (0.98x-1.04x vs. CUDA v1, noise-level) — the kernel is latency-bound by dependency-chain length, not instruction count, so cutting sync-call count without shortening the chain doesn't help. Bank-conflict elimination checked via a genuine padded-vs-unpadded A/B, not assumed: 0 conflicts in both — see Results below
 - [ ] CUDA C++: warp-shuffle reduction, occupancy analysis
 - [ ] CUDA C++: split-K, packaged as a PyTorch extension
-- [x] Correctness test suite for the reference implementation (page boundaries, extreme/ragged/zero-length sequences, non-contiguous block tables with unreferenced "holes", GQA ratios 1/4/6/8, full input-validation coverage, 2000-case randomized fuzz vs. an independently-written SDPA oracle) plus kernel-vs-reference suites for Triton v1, v2, v3, v4, and CUDA v1 (204 cases at default settings, `tests/`), including v4's split-invariance check and a bit-exact `num_splits=1`-vs-v1 equivalence test.
+- [x] Correctness test suite for the reference implementation (page boundaries, extreme/ragged/zero-length sequences, non-contiguous block tables with unreferenced "holes", GQA ratios 1/4/6/8, full input-validation coverage, 2000-case randomized fuzz vs. an independently-written SDPA oracle) plus kernel-vs-reference suites for Triton v1, v2, v3, v4, and CUDA v1, v2 (236 cases at default settings, `tests/`), including v4's split-invariance check, a bit-exact `num_splits=1`-vs-v1 equivalence test, and a bit-exact CUDA v1-vs-v2 equivalence test.
 - [ ] Nsight-driven optimization log with before/after profiles
 - [ ] Benchmark against FlashInfer (A100)
 - [ ] Roofline plot using measured (not nominal) peak bandwidth
@@ -186,10 +186,12 @@ throwaway add-kernel before any real logic depended on it. A direct port
 of `_paged_attn_decode_v1_kernel`'s algorithm (same grid, same
 online-softmax recurrence) but deliberately more naive: no page-tile
 batching (token-by-token dot products via a block-wide shared-memory tree
-reduction, instead of Triton's tiled `tl.dot`) and no K/V sharing across
-the `gqa_ratio` query rows. That gap is intentional — it's the baseline
-CUDA v2's shared-memory tiling roadmap item gets measured against, the
-same role Triton v1 played for Triton v2.
+reduction, instead of Triton's tiled `tl.dot`). K/V is already loaded once
+per token into a register and reused across all `gqa_ratio` rows — the
+real per-row-repeated cost is the reduction itself, run independently
+`gqa_ratio` times per token instead of batched across rows. That gap is
+intentional — it's the baseline CUDA v2's shared-memory tiling roadmap
+item gets measured against, the same role Triton v1 played for Triton v2.
 
 Correctness: same shape matrix and tolerance as Triton v1's test suite
 (`tests/test_kernel_cuda_v1.py`, 31 cases, all passing). Unlike Triton,
@@ -213,13 +215,62 @@ isn't memory-bound at all) while it issues 1.47M shared-memory load
 instructions from just 2 thread blocks — one full block-wide
 reduction-and-barrier per token per row, `gqa_ratio * seq_len` times per
 block. That instruction/sync volume, not bandwidth, is the cost v2's
-shared-memory K/V tiling is expected to amortize away. Bank conflicts
-(`l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum`) measure **0**
-at batch=1 — the reduction's own stride-1 addressing is conflict-free by
-construction, unlike Week 0's deliberately-strided test kernel — so
-bank-conflict elimination isn't fixing a v1 problem; it'll matter for the
-new 2D K/V tile layout v2 introduces. Full mechanism and the batch=64
+batched shared-memory reduction is expected to amortize away. Bank
+conflicts (`l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum`)
+measure **0** at batch=1 — the reduction's own stride-1 addressing is
+conflict-free by construction, unlike Week 0's deliberately-strided test
+kernel — so bank-conflict elimination may not be a real lever here at
+all; v2 checks it explicitly with a padded-vs-unpadded A/B rather than
+skipping it on that prediction. Full mechanism and the batch=64
 numbers in [profiles/notes.md](profiles/notes.md).
+
+**CUDA v2 (batched shared-memory reduction)** — batches the score
+reduction across all `gqa_ratio` query rows into one shared-memory tile
+per token, instead of CUDA v1's one independent block-wide tree reduction
+per `(row, token)` pair. Hypothesis: cutting `__syncthreads()` call count
+~6x (from `gqa_ratio * seq_len * 9` to `seq_len * 9`) should cut latency
+accordingly, since `barrier` was a top-3 stall category in CUDA v1's
+profile.
+
+Correctness: 32 cases pass (`tests/test_kernel_cuda_v2.py`), including a
+direct bit-exact comparison against CUDA v1 (max diff 0.0) confirming v2
+is a pure reassociation of v1's math.
+
+**The hypothesis was wrong — reported as measured, not adjusted after the
+fact.** `cuda_v2` vs. `cuda_v1` lands at 0.98x-1.04x across every batch
+size — noise-level, no real win, despite `smsp__inst_executed.sum`
+dropping 21% and shared-memory load/store instruction counts dropping
+56-61%. NCU explains why: `smsp__average_warp_latency_issue_stalled_
+barrier.ratio` is *higher* in v2 (4.78M) than v1 (2.36M), the opposite of
+the predicted direction — fewer `__syncthreads()` calls, but each one now
+waits on 6x more serialized work before it can release, so total barrier
+stall time doesn't drop. Both `sm__throughput` and `dram__throughput`
+stay near-zero in both versions at batch=1: this kernel is bound by the
+*length* of its serialized dependency chain (still 9 sequentially-
+dependent stages per token in both versions — only the width of each
+stage changed), not by instruction count or bandwidth. Checked from three
+independent angles (wall-clock, NCU-measured kernel duration,
+instruction/stall-reason counts) — all agree it's a genuine null result,
+not a methodology artifact.
+
+Bank-conflict A/B (padded `row_stride=head_dim+1` vs. unpadded
+`row_stride=head_dim`, same templated-kernel technique as Week 0): **0
+conflicts in both**, no measurable latency difference at batch=64 (13.74
+ms vs. 13.56 ms) — confirms the prediction from CUDA v1's own finding
+(head_dim is always the per-thread lane; row/token axes are always looped
+serially within a thread, never spread across a warp) rather than
+skipping the check. Occupancy: the wider tile drops
+`launch__occupancy_limit_shared_mem` from 21 to 15 blocks/SM, but
+registers stay the binding ceiling at 12 in both — no occupancy cost,
+unlike Triton v2's real regression.
+
+Bottom line: shared-memory tiling implemented and correctness-verified,
+bank-conflict elimination checked and confirmed unnecessary for this
+access pattern — but not a latency win. The real bottleneck is
+dependency-chain length, which is what v3's warp-shuffle reduction (a
+different reduction algorithm, not just a different grouping of the same
+tree reduction) targets next. Full data in
+[profiles/notes.md](profiles/notes.md).
 
 ## Repo layout
 
@@ -242,15 +293,15 @@ RTX 3060 Laptop (6GB) on WSL2 for development; cross-hardware validation planned
 uv venv --python 3.12
 uv pip install -r requirements.txt
 
-# correctness (reference oracle + Triton v1/v2/v3/v4 + CUDA v1 kernels, needs a CUDA GPU for the kernel half)
+# correctness (reference oracle + Triton v1/v2/v3/v4 + CUDA v1/v2 kernels, needs a CUDA GPU for the kernel half)
 uv run pytest tests/ -q
-# CUDA v1 alone (JIT-compiles cuda/*.cu on first run, cached after that)
-uv run pytest tests/test_kernel_cuda_v1.py -q
+# CUDA kernels alone (JIT-compiles cuda/*.cu on first run, cached after that)
+uv run pytest tests/test_kernel_cuda_v1.py tests/test_kernel_cuda_v2.py -q
 # full 2000-case reference fuzz / 100-case kernel fuzz (defaults are fast subsets):
 PAGED_ATTN_FUZZ_ITERS=2000 uv run pytest tests/test_reference_fuzz.py -q
 PAGED_ATTN_KERNEL_FUZZ_ITERS=100 uv run pytest tests/test_kernel_v1.py::test_fuzz_curated_shape_matrix -q
 
-# latency: reference vs. Triton v1 vs. v2 vs. v3 vs. v4 vs. CUDA v1, batch sweep at the primary target shape
+# latency: reference vs. Triton v1 vs. v2 vs. v3 vs. v4 vs. CUDA v1 vs. CUDA v2, batch sweep at the primary target shape
 uv run python bench/bench_decode.py
 # v4's num_splits sweep at batch=1 (sets the wrapper's default)
 uv run python bench/bench_v4_num_splits.py
