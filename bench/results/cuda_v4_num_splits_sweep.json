@@ -1,0 +1,161 @@
+{
+  "timestamp": "2026-08-05T15:45:18",
+  "shape": {
+    "batch": 1,
+    "num_kv_heads": 2,
+    "gqa_ratio": 6,
+    "head_dim": 128,
+    "page_size": 16,
+    "seq_len": 2048
+  },
+  "cuda_v3_ms_median": 4.3766,
+  "cuda_v3_ms_all_trials": [
+    4.352,
+    4.3735,
+    4.3817,
+    4.3785,
+    4.3837,
+    4.3766,
+    4.3735,
+    4.4369,
+    4.3735
+  ],
+  "sweep": [
+    {
+      "num_splits": 1,
+      "cuda_v4_ms_median": 4.5609,
+      "cuda_v4_ms_all_trials": [
+        4.5384,
+        4.5609,
+        4.5619,
+        4.5657,
+        4.6316,
+        4.5609,
+        4.5609,
+        4.5609,
+        4.5609
+      ],
+      "speedup_vs_cuda_v3": 0.96
+    },
+    {
+      "num_splits": 2,
+      "cuda_v4_ms_median": 2.2896,
+      "cuda_v4_ms_all_trials": [
+        2.2774,
+        2.2897,
+        2.2896,
+        2.3224,
+        2.2924,
+        2.2886,
+        2.2897,
+        2.2895,
+        2.2895
+      ],
+      "speedup_vs_cuda_v3": 1.91
+    },
+    {
+      "num_splits": 4,
+      "cuda_v4_ms_median": 1.1561,
+      "cuda_v4_ms_all_trials": [
+        1.15,
+        1.1561,
+        1.1602,
+        1.1561,
+        1.16,
+        1.1561,
+        1.1568,
+        1.1561,
+        1.1561
+      ],
+      "speedup_vs_cuda_v3": 3.79
+    },
+    {
+      "num_splits": 8,
+      "cuda_v4_ms_median": 0.5959,
+      "cuda_v4_ms_all_trials": [
+        0.5919,
+        0.5959,
+        0.596,
+        0.596,
+        0.5988,
+        0.5949,
+        0.596,
+        0.5949,
+        0.5949
+      ],
+      "speedup_vs_cuda_v3": 7.34
+    },
+    {
+      "num_splits": 16,
+      "cuda_v4_ms_median": 0.3287,
+      "cuda_v4_ms_all_trials": [
+        0.3276,
+        0.3286,
+        0.3297,
+        0.3287,
+        0.3327,
+        0.3277,
+        0.3328,
+        0.3285,
+        0.3287
+      ],
+      "speedup_vs_cuda_v3": 13.31
+    },
+    {
+      "num_splits": 32,
+      "cuda_v4_ms_median": 0.2222,
+      "cuda_v4_ms_all_trials": [
+        0.2212,
+        0.2221,
+        0.2243,
+        0.223,
+        0.2273,
+        0.2222,
+        0.2232,
+        0.2221,
+        0.2222
+      ],
+      "speedup_vs_cuda_v3": 19.7
+    },
+    {
+      "num_splits": 64,
+      "cuda_v4_ms_median": 0.2109,
+      "cuda_v4_ms_all_trials": [
+        0.2099,
+        0.2109,
+        0.2099,
+        0.212,
+        0.2109,
+        0.2109,
+        0.2099,
+        0.2109,
+        0.2109
+      ],
+      "speedup_vs_cuda_v3": 20.75
+    },
+    {
+      "num_splits": 128,
+      "cuda_v4_ms_median": 0.3061,
+      "cuda_v4_ms_all_trials": [
+        0.303,
+        0.3031,
+        0.3062,
+        0.3062,
+        0.3062,
+        0.306,
+        0.3082,
+        0.3061,
+        0.3052
+      ],
+      "speedup_vs_cuda_v3": 14.3
+    }
+  ],
+  "best_num_splits": 64,
+  "trials_per_config": 9,
+  "gpu_name": "NVIDIA GeForce RTX 3060 Laptop GPU",
+  "driver_version": "610.74",
+  "power_draw_w": 51.82,
+  "power_limit_w": null,
+  "sm_clock_mhz": 1950.0,
+  "method": "cuda.Event timing, best-of-50 after 15 warmup iters PER TRIAL, 9 independent trials per config in round-robin order (not blocked per config) to spread thermal/clock drift evenly, median across trials reported. Swept at batch=1 specifically, the scenario CUDA v1/v2/v3 are stuck at grid=(1, num_kv_heads)=2 thread blocks regardless of tuning. Compared against CUDA v3 (not v1 or Triton v1) since v3 is what v4 needs to beat."
+}

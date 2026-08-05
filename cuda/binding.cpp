@@ -10,4 +10,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "bank-conflict A/B only, not the production path)");
   m.def("forward_v3", &paged_attn_decode_cuda_v3_launch,
         "Paged attention decode, CUDA v3 (warp-shuffle reduction, one warp per block)");
+  m.def("forward_v4", &paged_attn_decode_cuda_v4_launch,
+        "Paged attention decode, CUDA v4 (split-K along the sequence dimension)");
 }

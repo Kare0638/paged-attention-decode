@@ -4,7 +4,7 @@ Decode-phase attention kernel for LLM inference with paged KV cache and GQA supp
 
 ## Status
 
-Triton v1–v4 (naive, wider tiles, num_stages tuning, split-K) are implemented, tested, and benchmarked — see Results below. CUDA C++ v1 (naive baseline), v2 (batched shared-memory reduction), and v3 (warp-shuffle reduction, all as `torch.utils.cpp_extension` extensions) are also implemented, tested, and benchmarked — v2 landed as a null result on latency (honestly reported rather than adjusted); v3 changed the reduction algorithm itself instead of just its grouping and is a real, mechanistically-understood 1.37x-2.00x win over CUDA v1. Next up is CUDA v4 (split-K, packaged as a PyTorch extension). The A100/FlashInfer comparison is still ahead. This README gets updated with real benchmark numbers as each version ships — no numbers are reported until they're measured.
+Triton v1–v4 (naive, wider tiles, num_stages tuning, split-K) and CUDA C++ v1–v4 (naive baseline, batched shared-memory reduction, warp-shuffle reduction, split-K, all as `torch.utils.cpp_extension` extensions) are implemented, tested, and benchmarked — see Results below. This closes out the CUDA roadmap section. CUDA v4's split-K delivers the single largest win in the CUDA line (up to 20.64x vs. CUDA v3 at batch=1) but CUDA still trails Triton by roughly an order of magnitude in absolute terms — real, substantial progress across four versions (CUDA v1 was ~44x slower than Triton v1; CUDA v4 is ~2.8x slower than Triton v4), not a claim of parity, reported honestly in both directions. What remains: consolidating the Nsight optimization log, the FlashInfer/A100 comparison, and a roofline plot. This README gets updated with real benchmark numbers as each version ships — no numbers are reported until they're measured.
 
 ## Why this project
 
@@ -42,8 +42,8 @@ seq_lens:    [batch]
 - [x] Triton v4: split-K along the sequence dimension — real win at low batch (1.83x vs. v1 at batch=1), real loss at high batch (0.75x-0.85x at 32/64), same tradeoff shape as v2, reported in both directions — see Results below
 - [x] CUDA C++: explicit shared-memory tiling, bank-conflict elimination — `cuda/kernel_v2_shared_tile.cu` batches the score reduction across all GQA rows into one shared-memory tile per token instead of one reduction per row; correctness verified (bit-exact vs. CUDA v1), instruction count and shared-memory traffic both measurably lower, but **no latency win** (0.98x-1.04x vs. CUDA v1, noise-level) — the kernel is latency-bound by dependency-chain length, not instruction count, so cutting sync-call count without shortening the chain doesn't help. Bank-conflict elimination checked via a genuine padded-vs-unpadded A/B, not assumed: 0 conflicts in both — see Results below
 - [x] CUDA C++: warp-shuffle reduction, occupancy analysis — `cuda/kernel_v3_warp_shuffle.cu` replaces the tree-reduction-plus-`__syncthreads()` algorithm with warp-shuffle (one warp per block instead of one block spanning head_dim), a real, mechanistically-understood win this time: **1.37x-2.00x vs. CUDA v1**, growing with batch, from a ~4.2x drop in total instructions (no shared memory at all). Occupancy story is more nuanced than "more warp-shuffle = more occupancy": the register-bound ceiling rises 12→48 blocks/SM, but *achieved* occupancy (`sm__warps_active`) is actually lower than v1 at every batch tested (2.08% vs. 8.33% at batch=1) since each block now carries 1 warp instead of 4 — the speedup traces to the shorter dependency chain, not higher occupancy — see Results below
-- [ ] CUDA C++: split-K, packaged as a PyTorch extension
-- [x] Correctness test suite for the reference implementation (page boundaries, extreme/ragged/zero-length sequences, non-contiguous block tables with unreferenced "holes", GQA ratios 1/4/6/8, full input-validation coverage, 2000-case randomized fuzz vs. an independently-written SDPA oracle) plus kernel-vs-reference suites for Triton v1, v2, v3, v4, and CUDA v1, v2, v3 (268 cases at default settings, `tests/`), including v4's split-invariance check, a bit-exact `num_splits=1`-vs-v1 equivalence test, a bit-exact CUDA v1-vs-v2 equivalence test, and a close (~6e-8 max diff) CUDA v1-vs-v3 equivalence test.
+- [x] CUDA C++: split-K, packaged as a PyTorch extension — `cuda/kernel_v4_split_k.cu` adds a third grid dimension over sequence chunks, built on CUDA v3's warp-shuffle reduction (not v1's), reusing `analysis/split_k_derivation.md`'s merge math directly. `num_splits=64` (swept fresh against CUDA v3, not reused from Triton v4's `num_splits=16`) delivers a real **20.64x win vs. CUDA v3 at batch=1**, the largest single improvement in this project's CUDA line, shrinking to parity by batch=64 (same tradeoff shape as Triton v2/v4, much larger magnitude) — see Results below for the honest reality check against Triton v4
+- [x] Correctness test suite for the reference implementation (page boundaries, extreme/ragged/zero-length sequences, non-contiguous block tables with unreferenced "holes", GQA ratios 1/4/6/8, full input-validation coverage, 2000-case randomized fuzz vs. an independently-written SDPA oracle) plus kernel-vs-reference suites for Triton v1, v2, v3, v4, and CUDA v1, v2, v3, v4 (302 cases at default settings, `tests/`), including both split-K versions' split-invariance checks, a bit-exact `num_splits=1`-vs-v1 equivalence test (Triton), a bit-exact CUDA v1-vs-v2 equivalence test, a close (~6e-8) CUDA v1-vs-v3 equivalence test, and a bit-exact `num_splits=1`-vs-CUDA-v3 equivalence test.
 - [ ] Nsight-driven optimization log with before/after profiles
 - [ ] Benchmark against FlashInfer (A100)
 - [ ] Roofline plot using measured (not nominal) peak bandwidth
@@ -321,6 +321,70 @@ conflicts: 0 at both batches — there's no shared memory left in this
 kernel for Week 0's padding technique to apply to. Full data in
 [profiles/notes.md](profiles/notes.md).
 
+**CUDA v4 (split-K)** — the last CUDA roadmap item. Adds a third grid
+dimension over sequence chunks, the same fix already applied once for
+Triton (`analysis/split_k_derivation.md`, reused directly — the merge
+math is language-agnostic, no new derivation needed). Built on **CUDA
+v3's warp-shuffle reduction**, not v1's tree reduction — the best
+per-block building block available now, not the first one — so the
+primary comparison here is against CUDA v3.
+
+Correctness: 34 cases pass (`tests/test_kernel_cuda_v4.py`). `num_splits=1`
+vs. CUDA v3 measured bit-exact (max diff 0.0) before picking a tolerance
+— phase 1 at `num_splits=1` is byte-for-byte v3's loop, phase 2
+degenerates to a single term.
+
+`num_splits` swept fresh against CUDA v3 (`bench/bench_cuda_v4_num_splits.py`,
+batch=1), not reused from Triton v4's `num_splits=16`: a **sharp peak at
+64** (20.75x vs. CUDA v3), not Triton's broad flat plateau — dropping off
+by 128. Set as the wrapper default.
+
+**The magnitude here dwarfs every prior version in this project, Triton
+or CUDA — because CUDA v3's batch=1 baseline had far more idle
+parallelism left to reclaim:**
+
+| batch | CUDA v3 | CUDA v4 | CUDA v4 vs. CUDA v3 |
+|---|---|---|---|
+| 1 | 4.373 ms | 0.212 ms | **20.64x** |
+| 16 | 4.789 ms | 1.538 ms | 3.11x |
+| 64 | 6.658 ms | 6.575 ms | 1.01x |
+
+Same tradeoff shape as Triton v2/v4 and CUDA v2's comparisons (real win
+at low batch, shrinking to parity at high batch), a much larger low-batch
+win than any prior version.
+
+**The honest reality check, committed to before measuring**: CUDA v4
+still trails Triton v4 substantially in absolute terms —
+
+| batch | Triton v4 | CUDA v4 | CUDA v4 vs. Triton v4 |
+|---|---|---|---|
+| 1 | 0.077 ms | 0.212 ms | 0.36x (~2.8x slower) |
+| 64 | 0.546 ms | 6.575 ms | 0.08x (~12.5x slower) |
+
+Not competitive against Triton in absolute terms — but the *relative*
+gap has closed enormously across the CUDA line: CUDA v1 was ~44x slower
+than Triton v1 at batch=1; CUDA v4 is ~2.8x slower than Triton v4 at the
+same batch, and only ~1.6x slower than **Triton v1** — the naive
+baseline this whole CUDA line has been chasing. Real, substantial
+progress across four versions, not a claim of parity.
+
+NCU explains both ends of the tradeoff. At batch=1, an ironic finding:
+phase 2 (grid `(batch, num_kv_heads)` only — the exact same 2-block
+grid-starvation problem split-K exists to fix, since the extra grid
+dimension only applies to phase 1) actually costs *more* than phase 1
+(233.5 us vs. 133.6 us) — at `num_splits=64`, phase 2 does `64 * 6 = 384`
+sequential merge iterations per thread with only 2 blocks to hide that
+behind. This is also why the sweep peaked at 64 rather than climbing
+further: past that point, phase 2's linearly-growing cost overtakes
+phase 1's shrinking per-split cost. At batch=64, phase 1 dominates
+(6.41 ms of ~6.7 ms total) and is genuinely DRAM-bandwidth-bound (85.96%
+— the highest this kernel has shown at any batch): 8192 blocks at a
+`num_splits` tuned for batch=1 and never shrinking fragments what would
+be efficient transfers, the same mechanism already documented for
+Triton v4's high-batch regression, more pronounced here since the split
+count doesn't adapt to batch (a known follow-on, not silently ignored).
+Full data in [profiles/notes.md](profiles/notes.md).
+
 ## Repo layout
 
 ```
@@ -342,18 +406,19 @@ RTX 3060 Laptop (6GB) on WSL2 for development; cross-hardware validation planned
 uv venv --python 3.12
 uv pip install -r requirements.txt
 
-# correctness (reference oracle + Triton v1/v2/v3/v4 + CUDA v1/v2/v3 kernels, needs a CUDA GPU for the kernel half)
+# correctness (reference oracle + Triton v1/v2/v3/v4 + CUDA v1/v2/v3/v4 kernels, needs a CUDA GPU for the kernel half)
 uv run pytest tests/ -q
 # CUDA kernels alone (JIT-compiles cuda/*.cu on first run, cached after that)
-uv run pytest tests/test_kernel_cuda_v1.py tests/test_kernel_cuda_v2.py tests/test_kernel_cuda_v3.py -q
+uv run pytest tests/test_kernel_cuda_v1.py tests/test_kernel_cuda_v2.py tests/test_kernel_cuda_v3.py tests/test_kernel_cuda_v4.py -q
 # full 2000-case reference fuzz / 100-case kernel fuzz (defaults are fast subsets):
 PAGED_ATTN_FUZZ_ITERS=2000 uv run pytest tests/test_reference_fuzz.py -q
 PAGED_ATTN_KERNEL_FUZZ_ITERS=100 uv run pytest tests/test_kernel_v1.py::test_fuzz_curated_shape_matrix -q
 
-# latency: reference vs. Triton v1 vs. v2 vs. v3 vs. v4 vs. CUDA v1 vs. v2 vs. v3, batch sweep at the primary target shape
+# latency: reference vs. Triton v1 vs. v2 vs. v3 vs. v4 vs. CUDA v1 vs. v2 vs. v3 vs. v4, batch sweep at the primary target shape
 uv run python bench/bench_decode.py
-# v4's num_splits sweep at batch=1 (sets the wrapper's default)
+# num_splits sweeps at batch=1 (set each wrapper's default)
 uv run python bench/bench_v4_num_splits.py
+uv run python bench/bench_cuda_v4_num_splits.py
 ```
 
 ## License

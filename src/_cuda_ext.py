@@ -17,6 +17,7 @@ _SOURCES = [
     "kernel_v1_naive.cu",
     "kernel_v2_shared_tile.cu",
     "kernel_v3_warp_shuffle.cu",
+    "kernel_v4_split_k.cu",
     "binding.cpp",
 ]
 
