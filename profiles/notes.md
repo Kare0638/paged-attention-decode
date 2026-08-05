@@ -956,3 +956,102 @@ percent higher throughput than a balanced read+write copy on this GPU's
 memory controller. Filed as a real, measured discrepancy worth knowing
 about if this roofline ceiling is reused elsewhere, not swept under the
 rug because it's a slightly awkward number.
+
+## Benchmark against FlashInfer — on RTX 3060 Laptop, not A100 (2026-08-05)
+
+Last roadmap item, originally scoped as an A100 comparison. Run instead
+on the same RTX 3060 Laptop (Ampere sm_86, same family as A100's sm_80)
+everything else in this project was measured on — a real A100 rental was
+planned separately, but this doesn't need to wait on that.
+
+**A real environment hazard, caught before it corrupted anything.**
+`uv pip install flashinfer-python` initially pulled in a full CUDA 13
+toolchain as a side effect (`nvidia-cutlass-dsl`, `cuda-python`, etc.),
+upgrading this project's pinned `torch==2.11.0+cu128` /
+`triton==3.6.0` to `torch==2.13.0+cu130` / `triton==3.7.1` — global,
+silent, and exactly the kind of change that would have invalidated every
+historical number in this file (Triton recompiles its own kernels; a
+different Triton *compiler* version is a real, uncontrolled confound,
+independent of anything this project did). Caught immediately, reverted
+(`torch==2.11.0+cu128` pinned back explicitly by local-version tag, not
+just by release number — a plain `torch==2.11.0` re-resolves to whatever
+CUDA tag happens to be newest, which was *not* `+cu128` anymore), and the
+full 302-test suite re-run to confirm the revert was real, not just
+version-number-deep, before touching anything else again.
+
+Built an isolated venv (`.venv-flashinfer`) to let FlashInfer's natural
+dependency resolution happen without touching the main environment at
+all, and re-verified the full 302-test suite passed there too (under
+`torch==2.13.0+cu130`/`triton==3.7.1`) before trusting anything measured
+in it. Then, checking whether that isolation was actually load-bearing:
+the leftover `flashinfer-python`/`cuda-python`/`nvidia-cutlass-dsl`
+packages from the first (reverted) install attempt were still sitting in
+the *main* venv, now paired with the reverted, pinned
+`torch==2.11.0+cu128`/`triton==3.6.0` — and `tests/test_flashinfer_adapter.py`
+passed 8/8 against that combination. **The forced upgrade was `uv`'s
+dependency resolver picking the newest mutually-compatible set from a
+blank slate, not an actual hard runtime requirement** — FlashInfer
+runs correctly against this project's already-pinned environment. The
+isolated venv (5GB, since deleted) turned out unnecessary; every number
+below comes from a single process, in this project's one pinned
+environment, alongside `v4` and `cuda_v4` — a true same-run comparison,
+not two runs stitched together on paper.
+
+**Adapter correctness** (`src/flashinfer_adapter.py`,
+`tests/test_flashinfer_adapter.py`, 8 cases): FlashInfer's paged KV cache
+tensors already use the exact layout this project's own `k_cache`/
+`v_cache` use throughout (`[num_pages, page_size, num_kv_heads,
+head_dim]`, NHD) — no data-layout conversion needed. The one real piece
+of adapter logic is converting this project's dense `block_table
+[batch, max_pages_per_seq]` + `seq_lens [batch]` into FlashInfer's
+CSR-style `(indptr, indices, last_page_len)`, checked against the
+reference oracle at the primary shape, both page-boundary parities
+(`seq_len` evenly divisible by `page_size` and not — `last_page_len`'s
+two branches), GQA ratios 1/4/6/8, and a ragged batch with independent
+per-item `seq_lens`. All 8 pass at this project's standard fp16
+tolerance.
+
+**Methodology**: `use_tensor_cores=True` — FlashInfer's own documented
+recommendation for GQA decode (this project's GQA ratio 6); the
+CUDA-core path is documented to leave real performance on the table for
+GQA, so the default would have been comparing against a weaker
+configuration than FlashInfer is capable of, the same "give the
+comparison a fair shot" discipline already applied when CUDA v4 got its
+own fresh `num_splits` sweep instead of reusing Triton v4's. FlashInfer's
+`plan()` (building reusable auxiliary structures from `indptr`/`indices`/
+`last_page_len`) is called once per batch size, outside the timed trial
+loop — only `run()` is timed, matching both FlashInfer's own documented
+plan-once/run-many usage and this project's standing "assert-forced-a-sync"
+lesson about not measuring one-time setup as a per-call cost.
+
+**Results** (`bench/bench_flashinfer.py`, median of 15 interleaved
+trials, full table in `bench/results/flashinfer_comparison.json`):
+
+| batch | v4 (Triton) | cuda_v4 | FlashInfer | FlashInfer vs. v4 | FlashInfer vs. cuda_v4 |
+|---|---|---|---|---|---|
+| 1 | 0.0799 ms | 0.2386 ms | 0.0387 ms | **2.07x** | **6.17x** |
+| 4 | 0.0942 ms | 0.4925 ms | 0.0502 ms | 1.88x | 9.82x |
+| 16 | 0.1782 ms | 1.5084 ms | 0.1188 ms | 1.50x | 12.70x |
+| 64 | 0.5151 ms | 5.7743 ms | 0.4434 ms | 1.16x | 13.02x |
+
+FlashInfer wins at every batch size, as expected from a heavily-engineered
+production kernel library against two from-scratch learning
+implementations — not a surprising result, and not the point of this
+comparison. What's worth noting: the gap to Triton v4 (1.16x-2.07x) is
+far smaller than the gap to CUDA v4 (6.17x-13.02x), consistent with
+everything else measured in this project — Triton's tile-based, compiler-
+optimized codegen was always closer to competitive than the from-scratch
+CUDA line, all the way back to CUDA v1's ~44x gap to Triton v1. CUDA v4's
+own cuda_v4 numbers here (e.g. 0.2386ms at batch=1) sit within this
+project's already-documented run-to-run noise band for these
+sub-millisecond kernels (~12-37% CV, see Triton v4's num_splits sweep
+entry above) compared to `bench_decode.py`'s separately-measured 0.212ms
+— not a new discrepancy, the same measurement noise already characterized
+elsewhere in this file.
+
+**Bottom line**: this closes the last roadmap item. Not run on A100 (a
+real A100 rental remains a possible separate future addition, not
+promised here) — run instead on this project's own GPU, in this
+project's own pinned environment, after catching and fixing a real
+environment hazard along the way rather than letting it silently
+corrupt the comparison.

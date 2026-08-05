@@ -4,7 +4,7 @@ Decode-phase attention kernel for LLM inference with paged KV cache and GQA supp
 
 ## Status
 
-Triton v1–v4 (naive, wider tiles, num_stages tuning, split-K) and CUDA C++ v1–v4 (naive baseline, batched shared-memory reduction, warp-shuffle reduction, split-K, all as `torch.utils.cpp_extension` extensions) are implemented, tested, and benchmarked — see Results below. This closes out the CUDA roadmap section. CUDA v4's split-K delivers the single largest win in the CUDA line (up to 20.64x vs. CUDA v3 at batch=1) but CUDA still trails Triton by roughly an order of magnitude in absolute terms — real, substantial progress across four versions (CUDA v1 was ~44x slower than Triton v1; CUDA v4 is ~2.8x slower than Triton v4), not a claim of parity, reported honestly in both directions. What remains: the FlashInfer/A100 comparison. This README gets updated with real benchmark numbers as each version ships — no numbers are reported until they're measured.
+Triton v1–v4 (naive, wider tiles, num_stages tuning, split-K) and CUDA C++ v1–v4 (naive baseline, batched shared-memory reduction, warp-shuffle reduction, split-K, all as `torch.utils.cpp_extension` extensions) are implemented, tested, and benchmarked — see Results below. This closes out the CUDA roadmap section. CUDA v4's split-K delivers the single largest win in the CUDA line (up to 20.64x vs. CUDA v3 at batch=1) but CUDA still trails Triton by roughly an order of magnitude in absolute terms — real, substantial progress across four versions (CUDA v1 was ~44x slower than Triton v1; CUDA v4 is ~2.8x slower than Triton v4), not a claim of parity, reported honestly in both directions. All roadmap items are now measured, including a FlashInfer comparison run on this project's own RTX 3060 Laptop rather than A100 (see Results below) — an A100 re-run remains a possible future addition, not promised here. This README gets updated with real benchmark numbers as each version ships — no numbers are reported until they're measured.
 
 ## Why this project
 
@@ -43,9 +43,9 @@ seq_lens:    [batch]
 - [x] CUDA C++: explicit shared-memory tiling, bank-conflict elimination — `cuda/kernel_v2_shared_tile.cu` batches the score reduction across all GQA rows into one shared-memory tile per token instead of one reduction per row; correctness verified (bit-exact vs. CUDA v1), instruction count and shared-memory traffic both measurably lower, but **no latency win** (0.98x-1.04x vs. CUDA v1, noise-level) — the kernel is latency-bound by dependency-chain length, not instruction count, so cutting sync-call count without shortening the chain doesn't help. Bank-conflict elimination checked via a genuine padded-vs-unpadded A/B, not assumed: 0 conflicts in both — see Results below
 - [x] CUDA C++: warp-shuffle reduction, occupancy analysis — `cuda/kernel_v3_warp_shuffle.cu` replaces the tree-reduction-plus-`__syncthreads()` algorithm with warp-shuffle (one warp per block instead of one block spanning head_dim), a real, mechanistically-understood win this time: **1.37x-2.00x vs. CUDA v1**, growing with batch, from a ~4.2x drop in total instructions (no shared memory at all). Occupancy story is more nuanced than "more warp-shuffle = more occupancy": the register-bound ceiling rises 12→48 blocks/SM, but *achieved* occupancy (`sm__warps_active`) is actually lower than v1 at every batch tested (2.08% vs. 8.33% at batch=1) since each block now carries 1 warp instead of 4 — the speedup traces to the shorter dependency chain, not higher occupancy — see Results below
 - [x] CUDA C++: split-K, packaged as a PyTorch extension — `cuda/kernel_v4_split_k.cu` adds a third grid dimension over sequence chunks, built on CUDA v3's warp-shuffle reduction (not v1's), reusing `analysis/split_k_derivation.md`'s merge math directly. `num_splits=64` (swept fresh against CUDA v3, not reused from Triton v4's `num_splits=16`) delivers a real **20.64x win vs. CUDA v3 at batch=1**, the largest single improvement in this project's CUDA line, shrinking to parity by batch=64 (same tradeoff shape as Triton v2/v4, much larger magnitude) — see Results below for the honest reality check against Triton v4
-- [x] Correctness test suite for the reference implementation (page boundaries, extreme/ragged/zero-length sequences, non-contiguous block tables with unreferenced "holes", GQA ratios 1/4/6/8, full input-validation coverage, 2000-case randomized fuzz vs. an independently-written SDPA oracle) plus kernel-vs-reference suites for Triton v1, v2, v3, v4, and CUDA v1, v2, v3, v4 (302 cases at default settings, `tests/`), including both split-K versions' split-invariance checks, a bit-exact `num_splits=1`-vs-v1 equivalence test (Triton), a bit-exact CUDA v1-vs-v2 equivalence test, a close (~6e-8) CUDA v1-vs-v3 equivalence test, and a bit-exact `num_splits=1`-vs-CUDA-v3 equivalence test.
+- [x] Correctness test suite for the reference implementation (page boundaries, extreme/ragged/zero-length sequences, non-contiguous block tables with unreferenced "holes", GQA ratios 1/4/6/8, full input-validation coverage, 2000-case randomized fuzz vs. an independently-written SDPA oracle) plus kernel-vs-reference suites for Triton v1, v2, v3, v4, and CUDA v1, v2, v3, v4 (302 cases at default settings, `tests/`), including both split-K versions' split-invariance checks, a bit-exact `num_splits=1`-vs-v1 equivalence test (Triton), a bit-exact CUDA v1-vs-v2 equivalence test, a close (~6e-8) CUDA v1-vs-v3 equivalence test, and a bit-exact `num_splits=1`-vs-CUDA-v3 equivalence test. Plus 8 adapter-correctness cases for the FlashInfer comparison (`tests/test_flashinfer_adapter.py`, skipped unless `flashinfer` is installed) — 310 cases total when it is.
 - [x] Nsight-driven optimization log with before/after profiles — see [profiles/optimization_log.md](profiles/optimization_log.md)
-- [ ] Benchmark against FlashInfer (A100)
+- [x] Benchmark against FlashInfer — run on this project's own RTX 3060 Laptop, not A100 (see Results below and [`profiles/notes.md`](profiles/notes.md#benchmark-against-flashinfer--on-rtx-3060-laptop-not-a100-2026-08-05)); an A100 re-run remains a possible future addition
 - [x] Roofline plot using measured (not nominal) peak bandwidth — see [profiles/roofline.png](profiles/roofline.png), generated by [`bench/roofline.py`](bench/roofline.py)
 
 ## Results
@@ -54,8 +54,8 @@ seq_lens:    [batch]
 
 - Latency vs. the naive per-batch reference loop: 5.6x at batch=1, up to
   72.9x at batch=64 — this beats a naive Python loop, it is not yet a
-  claim of beating a strong baseline; that comparison (vs. FlashInfer) is
-  Week 6's job.
+  claim of beating a strong baseline; see the FlashInfer comparison below
+  for that.
 - NCU at batch=1 (the realistic single-request decode case): grid is
   `(1, 2, 1)` — only 2 thread blocks on a ~28-SM GPU, 8.33% occupancy,
   `long_scoreboard` (memory-wait) is the dominant stall reason. At
@@ -385,6 +385,20 @@ Triton v4's high-batch regression, more pronounced here since the split
 count doesn't adapt to batch (a known follow-on, not silently ignored).
 Full data in [profiles/notes.md](profiles/notes.md).
 
+**FlashInfer comparison** — run on this project's own RTX 3060 Laptop (Ampere sm_86, same family as A100's sm_80), not A100:
+
+- A real environment hazard caught and fixed along the way, worth stating plainly: installing `flashinfer-python` initially pulled in a full CUDA 13 toolchain as a side effect, silently upgrading this project's pinned `torch==2.11.0+cu128`/`triton==3.6.0` — a real confound (Triton recompiles its own kernels; a different compiler version could change performance independent of anything this project did). Caught, reverted, and re-verified (full 302-test suite green again) before proceeding. Turned out an isolated environment wasn't even necessary — FlashInfer runs correctly against this project's already-pinned environment (verified via `tests/test_flashinfer_adapter.py`, 8/8 passing) — so every number below comes from one process, one environment, alongside `v4` and `cuda_v4`, not two runs stitched together. Full story in [`profiles/notes.md`](profiles/notes.md#benchmark-against-flashinfer--on-rtx-3060-laptop-not-a100-2026-08-05).
+- `src/flashinfer_adapter.py` converts this project's dense `block_table`/`seq_lens` into FlashInfer's CSR-style `(indptr, indices, last_page_len)` — the KV cache tensor layout itself needs no conversion, it already matches FlashInfer's own NHD convention. `use_tensor_cores=True`, FlashInfer's own documented recommendation for GQA decode.
+- `bench/bench_flashinfer.py`, median of 15 interleaved trials, same methodology as `bench_decode.py`:
+
+| batch | v4 (Triton) | cuda_v4 | FlashInfer | FlashInfer vs. v4 | FlashInfer vs. cuda_v4 |
+|---|---|---|---|---|---|
+| 1 | 0.0799 ms | 0.2386 ms | 0.0387 ms | **2.07x** | **6.17x** |
+| 16 | 0.1782 ms | 1.5084 ms | 0.1188 ms | 1.50x | 12.70x |
+| 64 | 0.5151 ms | 5.7743 ms | 0.4434 ms | 1.16x | 13.02x |
+
+FlashInfer wins at every batch size — expected, comparing a production-grade kernel library against two from-scratch learning implementations, and not the point of the exercise. Worth noting: the gap to Triton v4 (1.16x-2.07x) is far smaller than to CUDA v4 (6.17x-13.02x), the same pattern seen throughout this project — Triton's compiler-optimized codegen was always closer to competitive than the from-scratch CUDA line.
+
 ## Repo layout
 
 ```
@@ -419,6 +433,20 @@ uv run python bench/bench_decode.py
 # num_splits sweeps at batch=1 (set each wrapper's default)
 uv run python bench/bench_v4_num_splits.py
 uv run python bench/bench_cuda_v4_num_splits.py
+# roofline plot (reads bench/results/*.json already produced above, no new GPU measurement)
+uv run python bench/roofline.py
+```
+
+**FlashInfer comparison** (optional — needs `flashinfer-python`, not in `requirements.txt` since it's only used by this one comparison, not the project's own kernels):
+
+```bash
+uv pip install flashinfer-python
+# verify this didn't silently move torch/triton off the pins above (it shouldn't, but check):
+uv run python -c "import torch, triton; print(torch.__version__, triton.__version__)"
+# if it did: uv pip install -r requirements.txt   # re-pin, then re-run the full test suite
+
+uv run pytest tests/test_flashinfer_adapter.py -q
+uv run python bench/bench_flashinfer.py
 ```
 
 ## License
