@@ -437,13 +437,12 @@ uv run python bench/bench_cuda_v4_num_splits.py
 uv run python bench/roofline.py
 ```
 
-**FlashInfer comparison** (optional — needs `flashinfer-python`, not in `requirements.txt` since it's only used by this one comparison, not the project's own kernels):
+**FlashInfer comparison** (optional — dependencies are pinned separately because they are only needed by the external baseline comparison):
 
 ```bash
-uv pip install flashinfer-python
-# verify this didn't silently move torch/triton off the pins above (it shouldn't, but check):
+uv pip install -r requirements-flashinfer-comparison.txt
+# verify the benchmark environment matches the checked-in results:
 uv run python -c "import torch, triton; print(torch.__version__, triton.__version__)"
-# if it did: uv pip install -r requirements.txt   # re-pin, then re-run the full test suite
 
 uv run pytest tests/test_flashinfer_adapter.py -q
 uv run python bench/bench_flashinfer.py

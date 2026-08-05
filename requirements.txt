@@ -7,7 +7,5 @@ numpy==2.5.1
 ninja==1.13.0
 matplotlib==3.11.1
 
-# flashinfer-python is deliberately NOT pinned here -- only bench/bench_flashinfer.py
-# and tests/test_flashinfer_adapter.py need it (an external baseline comparison, not
-# one of this project's own kernels). Install it separately if you want that
-# comparison; see README.md's Reproduce section for the install + verify steps.
+# The optional FlashInfer comparison is pinned separately in
+# requirements-flashinfer-comparison.txt.
