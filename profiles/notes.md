@@ -890,3 +890,69 @@ ends — including an honest surprise (phase 2 becoming the bottleneck at
 batch=1, not phase 1). CUDA v4 still trails Triton v4 by roughly an order
 of magnitude in absolute terms, closing this gap further is future work
 this project doesn't claim to have finished.
+
+## Roofline — measured peak bandwidth and compute (2026-08-05)
+
+`bench/roofline.py`: no new GPU measurement — reads the three JSON files
+already on disk (`peak_bw.json`, `peak_compute.json`,
+`decode_latency.json`) and computes FLOPs/bytes-moved analytically from
+the shape recorded in `decode_latency.json`, rather than re-measuring
+anything. This also finally gives the README's "~6 FLOP/byte" claim (in
+the "Why this project" section, present since early in the project) a
+checked-in, re-runnable derivation instead of leaving it as an uncited
+number: `intensity = FLOPs / bytes = (num_q_heads * seq_len * head_dim *
+4) / (num_kv_heads * seq_len * head_dim * 4)` — `seq_len * head_dim`
+cancels, leaving intensity as a pure function of GQA ratio. Computed at
+the primary shape: **6.00 FLOP/byte**, matching the existing claim.
+Measured ridge point: **84.19 FLOP/byte** (26.43 TFLOPS / 313.94 GB/s,
+both from Week 0's measurements) — confirms the README's "~84 FLOP/byte"
+figure was correct as stated.
+
+**One consequence worth stating plainly, not glossed over**: because
+intensity is fixed by GQA ratio alone, it is identical — 6.00 FLOP/byte
+— for all 9 implementations at every batch size. This isn't the classic
+multi-kernel roofline plot where different kernels sit at different
+horizontal positions; every point here shares one x-coordinate, and the
+entire story is how far below the bandwidth roof each version's *height*
+sits. The rendered plot (`profiles/roofline.png`) jitters each series
+into its own narrow x-lane purely for visual separation — disclosed in
+the plot's own title and axis label, not hidden — with batch size
+(1→64) encoded by marker size along each line instead of by x-position.
+
+**% of the measured roofline ceiling reached, batch=1 vs. batch=64**
+(full 9x7 table in `bench/results/roofline_data.json`):
+
+| impl | batch=1 | batch=64 |
+|---|---|---|
+| reference | 1.09% | 1.34% |
+| Triton v1 | 4.90% | **101.09%** |
+| Triton v2 | 11.44% | 92.98% |
+| Triton v3 | 10.69% | 91.96% |
+| Triton v4 | 8.73% | 78.33% |
+| CUDA v1 | 0.11% | 3.17% |
+| CUDA v2 | 0.12% | 3.28% |
+| CUDA v3 | 0.15% | 6.42% |
+| CUDA v4 | 3.15% | 6.50% |
+
+Consistent with everything measured so far: Triton's batch=64 numbers
+sit close to the bandwidth roof (78-101% of ceiling — this is the same
+DRAM-saturated regime `dram__throughput` already showed at ~95% for
+Triton v1 at batch=64), while every CUDA version stays in the single
+digits even at batch=64, matching the ~order-of-magnitude gap to Triton
+documented throughout this project. Split-K's batch=1 win is visible
+here too: Triton v4 (8.73%) and CUDA v4 (3.15%) both clear their
+non-split-K predecessors at batch=1, the direct roofline-view of the
+grid-starvation fix.
+
+**An honest anomaly, flagged rather than hidden**: Triton v1 at batch=64
+computes to **101.09% of the roofline ceiling** — slightly *over* the
+theoretical bandwidth-bound maximum. Not clipped or explained away here;
+the most likely cause is a methodology mismatch, not a violation of
+physics — `peak_bw.json`'s ceiling comes from a D2D `copy_` benchmark
+that moves `2 * size_bytes` (one read, one write, at parity), while the
+decode kernel is almost entirely reads (the KV cache) with a tiny output
+write, so a read-dominated access pattern plausibly sustains a few
+percent higher throughput than a balanced read+write copy on this GPU's
+memory controller. Filed as a real, measured discrepancy worth knowing
+about if this roofline ceiling is reused elsewhere, not swept under the
+rug because it's a slightly awkward number.
