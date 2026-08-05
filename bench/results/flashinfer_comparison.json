@@ -1,0 +1,111 @@
+{
+  "timestamp": "2026-08-05T19:04:16",
+  "shape": {
+    "num_kv_heads": 2,
+    "gqa_ratio": 6,
+    "head_dim": 128,
+    "page_size": 16,
+    "seq_len": 2048
+  },
+  "sweep": [
+    {
+      "batch": 1,
+      "seq_len": 2048,
+      "reference_ms": 0.5868,
+      "kernel_v4_ms": 0.0799,
+      "kernel_cuda_v4_ms": 0.2386,
+      "flashinfer_ms": 0.0387,
+      "v4_speedup_vs_reference": 7.35,
+      "cuda_v4_speedup_vs_reference": 2.46,
+      "flashinfer_speedup_vs_reference": 15.18,
+      "flashinfer_speedup_vs_v4": 2.07,
+      "flashinfer_speedup_vs_cuda_v4": 6.17
+    },
+    {
+      "batch": 2,
+      "seq_len": 2048,
+      "reference_ms": 1.0445,
+      "kernel_v4_ms": 0.0922,
+      "kernel_cuda_v4_ms": 0.2683,
+      "flashinfer_ms": 0.0481,
+      "v4_speedup_vs_reference": 11.33,
+      "cuda_v4_speedup_vs_reference": 3.89,
+      "flashinfer_speedup_vs_reference": 21.7,
+      "flashinfer_speedup_vs_v4": 1.91,
+      "flashinfer_speedup_vs_cuda_v4": 5.57
+    },
+    {
+      "batch": 4,
+      "seq_len": 2048,
+      "reference_ms": 1.9025,
+      "kernel_v4_ms": 0.0942,
+      "kernel_cuda_v4_ms": 0.4925,
+      "flashinfer_ms": 0.0502,
+      "v4_speedup_vs_reference": 20.19,
+      "cuda_v4_speedup_vs_reference": 3.86,
+      "flashinfer_speedup_vs_reference": 37.92,
+      "flashinfer_speedup_vs_v4": 1.88,
+      "flashinfer_speedup_vs_cuda_v4": 9.82
+    },
+    {
+      "batch": 8,
+      "seq_len": 2048,
+      "reference_ms": 3.7716,
+      "kernel_v4_ms": 0.1145,
+      "kernel_cuda_v4_ms": 0.855,
+      "flashinfer_ms": 0.086,
+      "v4_speedup_vs_reference": 32.95,
+      "cuda_v4_speedup_vs_reference": 4.41,
+      "flashinfer_speedup_vs_reference": 43.85,
+      "flashinfer_speedup_vs_v4": 1.33,
+      "flashinfer_speedup_vs_cuda_v4": 9.94
+    },
+    {
+      "batch": 16,
+      "seq_len": 2048,
+      "reference_ms": 7.3062,
+      "kernel_v4_ms": 0.1782,
+      "kernel_cuda_v4_ms": 1.5084,
+      "flashinfer_ms": 0.1188,
+      "v4_speedup_vs_reference": 41.01,
+      "cuda_v4_speedup_vs_reference": 4.84,
+      "flashinfer_speedup_vs_reference": 61.51,
+      "flashinfer_speedup_vs_v4": 1.5,
+      "flashinfer_speedup_vs_cuda_v4": 12.7
+    },
+    {
+      "batch": 32,
+      "seq_len": 2048,
+      "reference_ms": 14.7589,
+      "kernel_v4_ms": 0.2905,
+      "kernel_cuda_v4_ms": 2.857,
+      "flashinfer_ms": 0.2458,
+      "v4_speedup_vs_reference": 50.81,
+      "cuda_v4_speedup_vs_reference": 5.17,
+      "flashinfer_speedup_vs_reference": 60.05,
+      "flashinfer_speedup_vs_v4": 1.18,
+      "flashinfer_speedup_vs_cuda_v4": 11.63
+    },
+    {
+      "batch": 64,
+      "seq_len": 2048,
+      "reference_ms": 30.6527,
+      "kernel_v4_ms": 0.5151,
+      "kernel_cuda_v4_ms": 5.7743,
+      "flashinfer_ms": 0.4434,
+      "v4_speedup_vs_reference": 59.51,
+      "cuda_v4_speedup_vs_reference": 5.31,
+      "flashinfer_speedup_vs_reference": 69.13,
+      "flashinfer_speedup_vs_v4": 1.16,
+      "flashinfer_speedup_vs_cuda_v4": 13.02
+    }
+  ],
+  "trials_per_config": 15,
+  "gpu_name": "NVIDIA GeForce RTX 3060 Laptop GPU",
+  "driver_version": "610.74",
+  "power_draw_w": 75.65,
+  "power_limit_w": null,
+  "sm_clock_mhz": 1627.0,
+  "flashinfer_version": "0.6.16.post1",
+  "method": "cuda.Event timing, best-of-30 after 10 warmup iters PER TRIAL, 15 independent trials per implementation in round-robin order, median across trials reported -- same methodology as bench_decode.py. All four implementations run in this project's single pinned environment (torch 2.11.0+cu128, triton 3.6.0) so the comparison is a true single-process, single-environment measurement, not two runs stitched together (see this file's module docstring for why that mattered here). FlashInfer's plan() is called once per batch size, outside the timed trial loop -- only run() is timed, matching FlashInfer's own documented plan-once/run-many usage. use_tensor_cores=True (FlashInfer's own recommendation for GQA decode)."
+}
