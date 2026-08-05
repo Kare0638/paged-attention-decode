@@ -771,3 +771,122 @@ originally guessed: the *ceiling* rose (register pressure relieved), but
 *achieved* occupancy fell (fewer warps per block) — both true at once,
 and the latency win traces mainly to the shorter critical path, not to
 higher occupancy.
+
+## CUDA v4 — split-K (2026-08-05)
+
+Last CUDA roadmap item. `cuda/kernel_v4_split_k.cu` adds a third grid
+dimension over sequence chunks, the same fix already applied once for
+Triton (`analysis/split_k_derivation.md`, reused directly — no new
+derivation needed, the merge math is language-agnostic). Built on **CUDA
+v3's warp-shuffle reduction**, not v1's tree reduction — the best
+per-block building block available now, not the first one — so this
+section's primary comparison is against CUDA v3, with Triton v4 kept in
+view for the honest cross-language reality check.
+
+**Correctness**: `tests/test_kernel_cuda_v4.py`, 34 cases, all passing.
+`num_splits=1` vs. CUDA v3 measured **bit-exact (max diff 0.0)** before
+picking a tolerance — phase 1 at `num_splits=1` covers the whole sequence
+as one chunk, byte-for-byte v3's loop, and phase 2 degenerates to a
+single term. Other `num_splits` values show small (~1.22e-4 max diff)
+floating-point reordering noise from the online-softmax merge, well
+within the standard fp16 tolerance.
+
+**num_splits swept fresh against CUDA v3, not reused from Triton v4.**
+`bench/bench_cuda_v4_num_splits.py`, batch=1, median of 9 interleaved
+trials:
+
+| num_splits | speedup vs. CUDA v3 |
+|---|---|
+| 1 | 0.96x |
+| 2 | 1.91x |
+| 4 | 3.79x |
+| 8 | 7.34x |
+| 16 | 13.31x |
+| 32 | 19.70x |
+| **64** | **20.75x** |
+| 128 | 14.30x |
+
+A sharp peak at `num_splits=64`, not Triton v4's broad flat plateau —
+dropping off by 128. `num_splits=64` set as the wrapper default.
+
+**The magnitude here is much larger than Triton v4's ever was — because
+CUDA v3's batch=1 baseline had far more idle parallelism to reclaim.**
+`bench_decode.py`, `cuda_v4` vs. `cuda_v3`:
+
+| batch | cuda_v3 | cuda_v4 | cuda_v4 vs. cuda_v3 |
+|---|---|---|---|
+| 1 | 4.373 ms | 0.212 ms | **20.64x** |
+| 4 | 4.735 ms | 0.495 ms | 9.57x |
+| 16 | 4.789 ms | 1.538 ms | 3.11x |
+| 32 | 5.181 ms | 3.197 ms | 1.62x |
+| 64 | 6.658 ms | 6.575 ms | 1.01x |
+
+Same tradeoff *shape* as Triton v2/v4 and CUDA v2's predecessor
+comparisons (real win at low batch, shrinking to parity at high batch)
+— but a dramatically larger low-batch win than any prior version in this
+project, Triton or CUDA.
+
+**The honest reality check this section commits to, stated in the plan
+before measuring**: CUDA v4 still trails Triton v4 substantially.
+
+| batch | Triton v4 | cuda_v4 | cuda_v4 vs. Triton v4 |
+|---|---|---|---|
+| 1 | 0.077 ms | 0.212 ms | 0.36x (~2.8x slower) |
+| 16 | 0.138 ms | 1.538 ms | 0.09x (~11x slower) |
+| 64 | 0.546 ms | 6.575 ms | 0.08x (~12.5x slower) |
+
+Not a competitive result against Triton in absolute terms — but the
+*relative* gap to Triton has closed enormously across the CUDA
+optimization line: CUDA v1 was ~44x slower than Triton v1 at batch=1;
+CUDA v4 is ~2.8x slower than Triton v4 at the same batch, and only
+~1.6x slower than **Triton v1** (0.212ms vs. 0.136ms) — the naive Triton
+baseline this whole CUDA line has been chasing. Each CUDA version closed
+real ground; split-K alone (v3→v4) was the single largest step, a 20x
+cut at batch=1. Reported as what it is: real, substantial progress that
+still falls short of a tuned Triton kernel, not a claim of parity.
+
+**NCU: phase 1 vs. phase 2, and why the win shrinks with batch.**
+
+| metric | phase 1, batch=1 | phase 2, batch=1 | phase 1, batch=64 | phase 2, batch=64 |
+|---|---|---|---|---|
+| grid | (1, 2, 64) = 128 | (1, 2, 1) = 2 | (64, 2, 64) = 8192 | (64, 2, 1) = 128 |
+| `gpu__time_duration.sum` | 133.6 us | 233.5 us | 6.41 ms | 304.2 us |
+| `dram__throughput` | 11.11% | 2.39% | **85.96%** | 28.19% |
+| `sm__warps_active` | 8.82% | 2.08% | 32.98% | 8.36% |
+
+(NCU's per-kernel profiling overhead inflates each isolated measurement
+somewhat — these two don't sum exactly to `bench_decode.py`'s unprofiled
+total — but the *relative* comparison between phase 1 and phase 2 is
+what matters here and is unaffected.)
+
+**An ironic finding**: at batch=1, phase 2 — the stage designed to be
+"cheap" (`O(num_splits)`, not `O(seq_len)`, per the Triton v4 precedent)
+— actually costs *more* than phase 1. Phase 2's grid is `(batch,
+num_kv_heads)` only, the exact same 2-block grid-starvation problem this
+entire project's split-K story exists to fix — split-K's extra grid
+dimension only ever applies to phase 1. At `num_splits=64`, phase 2 does
+`64 * gqa_ratio(6) = 384` sequential merge iterations per thread with
+only 2 blocks total to hide that latency behind — cheap in FLOPs, not
+cheap in wall-clock time at this specific `num_splits`. This is also the
+mechanistic explanation for why the num_splits sweep peaked at 64 instead
+of climbing further: past that point, phase 2's linearly-growing
+sequential cost overtakes phase 1's shrinking per-split chunk cost.
+
+At batch=64, phase 1 dominates (6.41ms of the ~6.7ms total) and is now
+genuinely DRAM-bandwidth-bound (85.96%, the highest `dram__throughput`
+this kernel has shown at any batch) — 8192 blocks at `num_splits=64`
+fragments what would be efficient transfers into many more, smaller ones,
+the same "over-splitting wastes bandwidth once batch alone supplies
+enough parallelism" mechanism already documented for Triton v4's
+high-batch regression, more pronounced here because `num_splits=64` was
+tuned for batch=1 and never shrinks as batch grows (a fixed default, not
+a batch-adaptive one — a known, undone follow-on, not silently ignored).
+
+**Bottom line**: split-K delivers a real, large win at low batch (up to
+20.64x vs. CUDA v3), the biggest single improvement in this project's
+CUDA line, with the tradeoff shape fully expected from precedent (shrinks
+to parity at high batch) and a mechanism NCU explains cleanly on both
+ends — including an honest surprise (phase 2 becoming the bottleneck at
+batch=1, not phase 1). CUDA v4 still trails Triton v4 by roughly an order
+of magnitude in absolute terms, closing this gap further is future work
+this project doesn't claim to have finished.
