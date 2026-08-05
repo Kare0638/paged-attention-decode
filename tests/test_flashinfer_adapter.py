@@ -6,10 +6,10 @@ exercise the conversion logic (page boundaries, ragged batches, GQA
 ratios) via the same tests/kernel_test_utils.compare_to_reference used
 everywhere else in this project.
 
-Requires flashinfer, which only exists in the isolated .venv-flashinfer
-venv (see src/flashinfer_adapter.py's module docstring for why it's not
-in this project's main venv) -- skipped entirely, not failed, when it's
-not importable, so the main venv's test run stays clean.
+Requires the optional dependencies in requirements-flashinfer-comparison.txt
+(see src/flashinfer_adapter.py's module docstring for why they are separate) --
+skipped entirely, not failed, when flashinfer is not importable, so the main
+environment's test run stays clean.
 """
 
 from __future__ import annotations

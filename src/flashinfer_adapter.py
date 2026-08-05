@@ -26,12 +26,12 @@ import torch
 
 try:
     import flashinfer
-except ImportError as exc:  # pragma: no cover - only hit outside the isolated venv
+except ImportError as exc:  # pragma: no cover - only hit without optional dependencies
     raise ImportError(
         "flashinfer is not installed in this environment. This project's main venv "
         "deliberately does not depend on it (it pulls in a different torch/CUDA "
-        "toolchain) -- run this from the isolated .venv-flashinfer venv instead. "
-        "See profiles/notes.md's FlashInfer comparison entry for why."
+        "toolchain) -- install requirements-flashinfer-comparison.txt to run the "
+        "comparison. See profiles/notes.md's FlashInfer comparison entry for why."
     ) from exc
 
 _WORKSPACE_BYTES = 128 * 1024 * 1024  # FlashInfer's own recommended size

@@ -1,0 +1,4 @@
+-r requirements.txt
+
+# Exact external baseline version used for the checked-in comparison results.
+flashinfer-python==0.6.16.post1

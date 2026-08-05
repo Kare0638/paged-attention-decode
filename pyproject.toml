@@ -6,3 +6,14 @@ requires-python = ">=3.12"
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+
+[tool.uv]
+# requirements.txt pins an --extra-index-url (download.pytorch.org/whl/cu128)
+# for the exact torch/triton build; uv's default index-strategy only
+# considers a package's *first* index that lists it at all, which silently
+# makes numpy (and anything else pytorch's index also carries, at a
+# different version) unresolvable from a clean environment. Verified this
+# is a real, reproducible failure on a from-scratch venv, not
+# environment-specific -- unsafe-best-match restores normal "best version
+# across all indexes" resolution.
+index-strategy = "unsafe-best-match"

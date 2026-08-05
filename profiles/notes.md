@@ -1055,3 +1055,32 @@ promised here) — run instead on this project's own GPU, in this
 project's own pinned environment, after catching and fixing a real
 environment hazard along the way rather than letting it silently
 corrupt the comparison.
+
+**Follow-up, caught during review**: the ad-hoc `uv pip install
+flashinfer-python` reproduce step above worked in this session because it
+ran against an already-populated venv, but doesn't guarantee the same
+outcome for someone reproducing from scratch — a second, unpinned
+resolve could in principle land on a different `flashinfer-python`
+release than the one these results were measured against. Replaced with
+`requirements-flashinfer-comparison.txt` (`-r requirements.txt` +
+`flashinfer-python==0.6.16.post1` pinned exactly), so the comparison
+environment resolves deterministically in one pass instead of a
+second, separate install.
+
+Verifying that file from a genuinely clean venv (not this project's
+already-built-up `.venv`) surfaced an unrelated, **pre-existing** bug:
+plain `uv pip install -r requirements.txt` — this project's very first
+Reproduce step, unrelated to FlashInfer — fails on a clean venv with
+"no version of numpy==2.5.1" once `requirements.txt`'s
+`--extra-index-url` (needed to pin the exact `+cu128` torch build) is
+present, because `uv`'s default index-strategy only considers a
+package's *first* index that lists it at all, and PyTorch's index
+carries a `numpy` build that isn't `2.5.1`. This had gone undetected
+because the working `.venv` here was built up incrementally over many
+sessions, never actually re-resolved from scratch — exactly the kind
+of gap "it works on my machine" reproduce instructions can hide. Fixed
+via `[tool.uv] index-strategy = "unsafe-best-match"` in `pyproject.toml`
+(verified: both `requirements.txt` alone and
+`requirements-flashinfer-comparison.txt` now resolve cleanly from a
+fresh venv, landing on the exact same pins either way) — a project-level
+config, not a flag every reproduce command has to remember to pass.
