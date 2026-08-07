@@ -2,6 +2,8 @@
 
 Decode-phase attention kernel for LLM inference with paged KV cache and GQA support — being implemented from scratch in **Triton** and **CUDA C++**, optimized against Nsight Compute profiling data on a low-SM consumer GPU.
 
+**New here? See [HIGHLIGHTS.md](HIGHLIGHTS.md) for a 3-minute summary before diving into the full details below.**
+
 ## Status
 
 Triton v1–v4 (naive, wider tiles, num_stages tuning, split-K) and CUDA C++ v1–v4 (naive baseline, batched shared-memory reduction, warp-shuffle reduction, split-K, all as `torch.utils.cpp_extension` extensions) are implemented, tested, and benchmarked — see Results below. This closes out the CUDA roadmap section. CUDA v4's split-K delivers the single largest win in the CUDA line (up to 20.64x vs. CUDA v3 at batch=1) but CUDA still trails Triton by roughly an order of magnitude in absolute terms — real, substantial progress across four versions (CUDA v1 was ~44x slower than Triton v1; CUDA v4 is ~2.8x slower than Triton v4), not a claim of parity, reported honestly in both directions. All roadmap items are now measured, including a FlashInfer comparison run on this project's own RTX 3060 Laptop rather than A100 (see Results below). A100 cross-hardware validation (test suite + benchmarks re-run on a rented A100 80GB, see Results below) confirms the same qualitative findings hold on real datacenter hardware, not just this project's small development GPU. This README gets updated with real benchmark numbers as each version ships — no numbers are reported until they're measured.
