@@ -17,7 +17,12 @@ from __future__ import annotations
 import pytest
 import torch
 
-pytest.importorskip("src.flashinfer_adapter")
+# exc_type=ImportError needed explicitly: pytest 9.1 changed importorskip's
+# default exc_type from ImportError to the narrower ModuleNotFoundError, so
+# without this, src/flashinfer_adapter.py's deliberate re-raise (ModuleNotFoundError
+# caught, re-raised as a more helpful ImportError) no longer matches the
+# default and aborts the whole test session instead of skipping this file.
+pytest.importorskip("src.flashinfer_adapter", exc_type=ImportError)
 
 from src.flashinfer_adapter import paged_attention_decode_flashinfer  # noqa: E402
 from tests.kernel_test_utils import compare_to_reference, make_cache  # noqa: E402
