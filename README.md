@@ -1,5 +1,7 @@
 # Paged Attention Decode Kernel
 
+[![CI](https://github.com/Kare0638/paged-attention-decode/actions/workflows/ci.yml/badge.svg)](https://github.com/Kare0638/paged-attention-decode/actions/workflows/ci.yml)
+
 Decode-phase attention kernel for LLM inference with paged KV cache and GQA support — being implemented from scratch in **Triton** and **CUDA C++**, optimized against Nsight Compute profiling data on a low-SM consumer GPU.
 
 **New here? See [HIGHLIGHTS.md](HIGHLIGHTS.md) for a 3-minute summary before diving into the full details below.**
