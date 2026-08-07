@@ -1257,3 +1257,56 @@ confirmed structurally blocked, not abandoned after a shallow attempt.
 Would need a different provider offering privileged containers or
 bare-metal instances to get NCU data on A100; not pursued further here
 by explicit choice.
+
+## FlashInfer comparison on A100 (2026-08-07)
+
+Re-ran the RTX 3060 Laptop's FlashInfer comparison on the same A100 pod,
+same pinned environment, using the already-pinned
+`requirements-flashinfer-comparison.txt` (`flashinfer-python==0.6.16.post1`)
+— confirmed `torch==2.11.0+cu128`/`triton==3.6.0` stayed exactly pinned
+after installing it (no repeat of the earlier dependency-drift incident),
+and `tests/test_flashinfer_adapter.py` passed 8/8 before trusting any
+latency number. Full sweep in
+`bench/results/flashinfer_comparison_a100.json`.
+
+| batch | v4 (Triton) | cuda_v4 | FlashInfer | FlashInfer vs. v4 | FlashInfer vs. cuda_v4 |
+|---|---|---|---|---|---|
+| 1 | 0.1240 ms | 0.2944 ms | 0.0562 ms | 2.21x | 5.24x |
+| 16 | 0.1215 ms | 0.5297 ms | 0.0657 ms | 1.85x | 8.06x |
+| 64 | 0.1785 ms | 2.1841 ms | 0.1268 ms | 1.41x | 17.23x |
+
+Compared against the laptop's own numbers (`v4`/`FlashInfer vs. v4`,
+`FlashInfer vs. cuda_v4`): 2.07x/6.17x at batch=1, 1.50x/12.70x at
+batch=16, 1.16x/13.02x at batch=64.
+
+**FlashInfer's relative edge over this project's own `v4` is *larger* on
+A100 than on the laptop at every batch size** (2.21x vs. 2.07x at
+batch=1, growing to 1.85x vs. 1.50x at batch=16, 1.41x vs. 1.16x at
+batch=64) — the opposite direction from what "everything just runs
+faster on a bigger GPU" would predict for a fixed, unretuned `v4`.
+Plausible reading, not independently isolated: FlashInfer is a
+production library with kernel paths specifically tuned for Ampere
+datacenter cards (tensor-core paths for GQA decode, per its own
+documentation), while `v4` still uses `num_splits=16` — a value swept on
+the laptop's 28-SM profile, never retuned for A100, consistent with the
+same caveat already flagged for `cuda_v4`'s `num_splits=64` above.
+
+**The gap to `cuda_v4` doesn't plateau on A100 the way it did on the
+laptop — it keeps widening** (5.24x → 8.06x → 17.23x, vs. the laptop's
+6.17x → 12.70x → 13.02x, which grew then flattened). This tracks
+directly with `cuda_v4`'s own latency at batch=64 (2.1841ms on A100,
+worse in absolute terms than the laptop's `num_splits=64` default can
+apparently handle at A100 scale) while FlashInfer stays fast
+(0.1268ms) — the same over-fragmentation mechanism already documented
+for `cuda_v4`'s high-batch regression, compounding against a baseline
+(FlashInfer) that isn't standing still.
+
+**Bottom line**: FlashInfer wins at every batch size on A100 too, as
+expected — this was never going to flip. The value of running it here
+wasn't "does FlashInfer win" (already known) but whether the *shape* of
+the gap reproduces across hardware, and it mostly does with one honest
+wrinkle: this project's own kernels, tuned once on a laptop and never
+retuned, lose a bit more ground to a production library's A100-specific
+optimizations than the laptop-vs-laptop comparison alone would suggest
+— itself a real, useful finding about the cost of not retuning
+`num_splits` per GPU, not a discrepancy to explain away.
