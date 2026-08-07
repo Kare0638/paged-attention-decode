@@ -1310,3 +1310,79 @@ retuned, lose a bit more ground to a production library's A100-specific
 optimizations than the laptop-vs-laptop comparison alone would suggest
 — itself a real, useful finding about the cost of not retuning
 `num_splits` per GPU, not a discrepancy to explain away.
+
+## num_splits re-swept on A100 (2026-08-07)
+
+Reran `bench/bench_v4_num_splits.py` and `bench/bench_cuda_v4_num_splits.py`
+unmodified on the A100 pod — same methodology (median of 9 interleaved
+trials, `NUM_SPLITS_VALUES = [1, 2, 4, 8, 16, 32, 64, 128]`, batch=1),
+checking whether the laptop-tuned defaults (`num_splits=16` for Triton
+v4, `num_splits=64` for CUDA v4) are actually still good choices on a
+~108-SM GPU, rather than assuming they transfer. Full sweeps in
+`bench/results/v4_num_splits_sweep_a100.json` /
+`cuda_v4_num_splits_sweep_a100.json`.
+
+**The two kernels tell almost opposite stories.**
+
+**CUDA v4: `num_splits=64` is still the best value on A100 — no
+retuning actually needed.**
+
+| num_splits | speedup vs. cuda_v3, laptop | speedup vs. cuda_v3, A100 |
+|---|---|---|
+| 1 | 0.96x | 0.96x |
+| 8 | 7.34x | 7.12x |
+| 16 | 13.31x | 12.77x |
+| 32 | 19.70x | 19.23x |
+| **64** | **20.75x** | **20.63x** |
+| 128 | 14.30x | 15.39x |
+
+Both curves peak at exactly the same value with nearly identical
+magnitude — this project's existing default was already correct for
+A100, not a lucky guess validated after the fact by a separate,
+independent sweep. Directly explains why the earlier A100 `bench_decode.py`
+run found `cuda_v4` vs. `cuda_v3` at batch=1 landing on the *same*
+20.64x on both GPUs (documented above): the config actually is
+optimal on both, not coincidentally close.
+
+**Triton v4: the whole `num_splits` axis nearly flattens out on A100 —
+a real, qualitatively different regime, not just a shifted optimum.**
+
+| num_splits | speedup vs. v1, laptop | speedup vs. v1, A100 |
+|---|---|---|
+| 1 | 1.26x-1.37x | 1.53x |
+| 2 | 1.73x-1.83x | 1.54x |
+| 8 | 1.61x-1.83x | 1.55x |
+| 16 (default) | 1.64x-1.85x | 1.54x |
+| 64 | 1.57x-1.71x | 1.54x |
+| 128 | 1.22x-1.25x | 1.51x |
+
+On the laptop this was a real, broad plateau — a genuine ~40-50%
+spread between the worst (`num_splits=1` or `128`) and best
+(`num_splits=2-16`) configs. On A100, every value from 1 to 64 lands
+within **1.51x-1.55x of v1** — a ~3% spread, indistinguishable from
+noise given this project's own documented ~12-37% CV at these
+sub-millisecond latencies. `num_splits=8` is nominally "best" (1.55x)
+but not meaningfully different from the existing default of 16
+(1.54x) or even `num_splits=1` (1.53x, no split-K at all).
+
+**Why**: split-K's whole premise is fixing an *occupancy* problem — too
+few blocks (`batch * num_kv_heads` = 2 at batch=1) to fill the GPU's
+SMs. On the laptop's ~28 SMs, going from 2 blocks to `num_splits`x more
+genuinely changes how much of the GPU gets used. On A100's ~108 SMs,
+even `num_splits=64`'s ~128 blocks (`batch(1) * num_kv_heads(2) *
+num_splits(64)`) is still a small fraction of the chip, and — more to
+the point — the kernel is so fast in absolute terms on A100 (Triton v4
+at batch=1: 0.1185-0.124ms measured across separate runs) that launch
+overhead and other fixed costs plausibly dominate over whatever
+occupancy split-K still buys. Not independently isolated via NCU here
+(A100 NCU access is structurally blocked, see above) — a plausible
+mechanistic reading consistent with the measured flatness, not proven
+down to the metric level.
+
+**Bottom line, and no code change made**: both existing defaults
+(`num_splits=16` for Triton v4, `64` for CUDA v4) remain reasonable on
+A100 — CUDA v4's happens to be exactly optimal, Triton v4's sits
+squarely inside a flat band where nothing meaningfully beats it. Not
+changing the shipped defaults based on a single GPU's sweep; the
+laptop remains this project's primary development target, and this
+sweep's value was checking generalization, not chasing a new number.
