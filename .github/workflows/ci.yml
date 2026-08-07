@@ -1,0 +1,42 @@
+name: CI
+
+# GitHub Actions runners have no GPU, so this can't run the Triton/CUDA
+# kernels themselves -- every kernel-specific test file already guards
+# itself with `pytest.mark.skipif(not torch.cuda.is_available(), ...)` (or
+# `pytest.importorskip` for the optional FlashInfer adapter), so those
+# skip cleanly here rather than erroring. What this *does* run for real,
+# on plain CPU: the fp32 reference implementation, its input-validation
+# checks, edge cases, and the 2000-case fuzz suite against an
+# independently-written SDPA oracle -- genuine correctness signal, not a
+# skip-padded green checkmark. Verified locally against a from-scratch
+# CPU-only venv before writing this workflow: 80 passed, 223 skipped.
+#
+# Deliberately not requirements.txt here: that file pins the exact
+# +cu128 torch/triton build this project's own GPU work depends on, which
+# is both unnecessary (CI has no GPU to use it) and slow to install.
+# CPU-only torch is installed instead, pinned to the same release version
+# for consistency.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install CPU-only dependencies
+        run: |
+          pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cpu
+          pip install triton==3.6.0 pytest==9.1.1 numpy==2.5.1
+
+      - name: Run test suite (GPU-only kernel tests skip automatically without CUDA)
+        run: pytest tests/ -q
