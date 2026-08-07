@@ -1084,3 +1084,148 @@ via `[tool.uv] index-strategy = "unsafe-best-match"` in `pyproject.toml`
 `requirements-flashinfer-comparison.txt` now resolve cleanly from a
 fresh venv, landing on the exact same pins either way) — a project-level
 config, not a flag every reproduce command has to remember to pass.
+
+## A100 cross-hardware validation (2026-08-07)
+
+Optional follow-on, not part of the original roadmap: re-ran this
+project's own test suite and benchmarks on a rented A100 80GB PCIe
+(RunPod), in this project's own pinned environment
+(`torch==2.11.0+cu128`, `triton==3.6.0`, nvcc 12.8), to check whether
+the findings measured on the RTX 3060 Laptop generalize to a real
+datacenter GPU or were specific to this project's own small, low-SM
+development card.
+
+**Connectivity note, not a project finding but worth recording for next
+time**: RunPod's `ssh.runpod.io` proxy only supports interactive PTY
+sessions — non-PTY exec (`ssh host "command"`) is rejected outright
+("Your SSH client doesn't support PTY"), and even with a PTY forced,
+transferring a large base64-encoded payload through it corrupted the
+data (silent line-wrapping inside the interactive channel broke
+`base64 -d`). Switched to the pod's direct TCP port (`RUNPOD_PUBLIC_IP`
+/ `RUNPOD_TCP_PORT_22`, both exposed in the pod's own environment),
+which behaves like a normal `sshd` — plain `scp` worked, and every
+transferred file's md5sum was verified to match the pod's own before
+being trusted.
+
+**Two real bugs surfaced by testing on a genuinely fresh machine,
+neither caught by any amount of local testing on an already-built-up
+`.venv`:**
+
+1. `tests/test_flashinfer_adapter.py`'s `pytest.importorskip(...)` call
+   aborted the *entire* 302-test collection with a hard error instead of
+   skipping cleanly, because pytest 9.1 quietly changed
+   `importorskip`'s default `exc_type` from `ImportError` to the
+   narrower `ModuleNotFoundError`, and this project's adapter
+   deliberately re-raises a more helpful plain `ImportError`. Never
+   caught locally because this session's own venv always had
+   `flashinfer-python` installed (a leftover from an earlier mistake),
+   so the "flashinfer absent" skip path had literally never been
+   exercised until a genuinely clean environment hit it. Fixed with the
+   documented `exc_type=ImportError` override; verified both directions
+   (flashinfer present → 310 passed; flashinfer hidden → 302 passed, 1
+   skipped).
+2. `bench/roofline.py`'s plot title had "RTX 3060 Laptop" hardcoded as a
+   literal string — harmless on the machine it was written on, silently
+   wrong the moment it ran anywhere else. Fixed to read `gpu_name` from
+   `peak_bw.json` (already recorded there), so the title is correct on
+   whatever machine actually produced the data.
+
+**Peak bandwidth/compute** (`bench/measure_peak_bw.py`,
+`measure_peak_compute.py`; full records in
+`bench/results/peak_bw_a100.json` / `peak_compute_a100.json`):
+
+| | RTX 3060 Laptop | A100 80GB PCIe | ratio |
+|---|---|---|---|
+| peak bandwidth (measured) | 313.94 GB/s | 1699.39 GB/s | 5.41x |
+| peak compute (measured, fp16) | 26.43 TFLOPS | 245.85 TFLOPS | 9.30x |
+| ridge point | 84.19 FLOP/byte | 144.67 FLOP/byte | — |
+
+A100's ridge point sits substantially higher — this project's decode
+workload (~6 FLOP/byte, fixed by GQA ratio regardless of GPU) is
+proportionally *further* left of the ridge point on A100 than on the
+laptop, i.e. even more memory-bandwidth-bound in relative terms, despite
+the A100 having far more raw bandwidth in absolute terms.
+
+**Correctness**: full 302-test suite — 302 passed, 1 skipped
+(`test_flashinfer_adapter.py`, `flashinfer` not installed on this pod)
+in 485.72s, first run on this machine (includes JIT-compiling all four
+CUDA extensions for sm_80 plus Triton's own kernel compilation — nothing
+was cached going in). Confirms every kernel, both languages, compiles
+and produces correct output on a different GPU architecture (sm_80 vs.
+the laptop's sm_86) without any code changes.
+
+**Latency** (`bench/bench_decode.py`, same methodology, same shape;
+full sweep in `bench/results/decode_latency_a100.json`), Triton v4 and
+CUDA v4 (this project's best per language) at batch 1/16/64:
+
+| batch | Triton v3060 Laptop | A100 | | CUDA v3060 Laptop | A100 |
+|---|---|---|---|---|---|
+| 1 | 0.0765 ms | 0.1185 ms | | 0.2119 ms | 0.2952 ms |
+| 16 | 0.1382 ms | 0.1198 ms | | 1.5380 ms | 0.5360 ms |
+| 64 | 0.5458 ms | 0.1764 ms | | 6.5751 ms | 2.2368 ms |
+
+(Column header shorthand: "Triton"/"CUDA" = `v4`/`cuda_v4`.) In
+absolute terms A100 is faster everywhere except Triton v4 at batch=1 —
+expected: at batch=1 only 2 KV heads worth of grid parallelism exist
+without split-K, and A100's much larger SM count (~108 vs. the laptop's
+~28) has proportionally more idle capacity relative to its own peak, so
+a small-grid, launch-overhead-dominated kernel doesn't automatically
+benefit from a bigger card the way a bandwidth-saturating one does.
+
+**Two cross-hardware findings, the actual point of this exercise:**
+
+1. **`cuda_v4` vs. `cuda_v3` (split-K's win) reaches the *same* headline
+   number at batch=1 on both GPUs — 20.64x — but persists much further
+   into the batch sweep on A100** (3.04x at batch=64 vs. the laptop's
+   1.01x/parity):
+
+   | batch | cuda_v4 vs. cuda_v3, laptop | cuda_v4 vs. cuda_v3, A100 |
+   |---|---|---|
+   | 1 | 20.64x | 20.64x |
+   | 16 | 3.11x | 12.54x |
+   | 64 | 1.01x | 3.04x |
+
+   A plausible mechanism, not independently isolated beyond what's shown
+   here: `num_splits=64` (this project's default, tuned on the laptop's
+   28-SM occupancy profile) fragments transfers enough to erase the win
+   by batch=64 on a 28-SM card, but the same fixed split count has much
+   more room to still help on a ~108-SM card before over-fragmentation
+   catches up — consistent with, not proof of, the occupancy-fragmentation
+   story already documented for CUDA v4's batch=64 regression on the
+   laptop. **Caveat stated plainly**: `num_splits=64` was never re-swept
+   for A100's own occupancy profile; a fresh sweep (mirroring
+   `bench_cuda_v4_num_splits.py`'s methodology) could plausibly push the
+   A100 numbers higher still. Not done here — an honest scope limit, not
+   a claim that 64 is already optimal on this hardware.
+
+2. **`cuda_v4` vs. `Triton v4` (the honest CUDA-vs-Triton reality check)
+   has nearly the same *relative* shape on both GPUs**, despite an order
+   of magnitude difference in raw hardware capability:
+
+   | batch | cuda_v4 vs. Triton v4, laptop | cuda_v4 vs. Triton v4, A100 |
+   |---|---|---|
+   | 1 | 0.36x (~2.8x slower) | 0.40x (~2.5x slower) |
+   | 16 | 0.09x (~11x slower) | 0.22x (~4.5x slower) |
+   | 64 | 0.08x (~12.5x slower) | 0.08x (~12.5x slower) |
+
+   The batch=1 and batch=64 columns are close enough to call the same
+   story on both cards; batch=16 diverges more (11x vs. 4.5x slower),
+   plausibly downstream of finding 1 above (CUDA v4's relative
+   competitiveness at mid-batch depends on how well `num_splits=64`
+   suits the specific GPU's SM count, not just batch size alone). Taken
+   together: the CUDA-vs-Triton gap documented throughout this project
+   looks like it reflects real implementation-level differences (Triton's
+   compiler-optimized codegen vs. this project's own hand-written CUDA),
+   not an artifact specific to one small consumer GPU.
+
+**Roofline**: `profiles/roofline_a100.png` (regenerated with the
+`gpu_name` fix above), same single-workload-intensity story as the
+laptop's — full computed table in `bench/results/roofline_data_a100.json`.
+
+**Scope, stated plainly**: this validates that every kernel compiles
+and runs correctly on different hardware and that this project's
+qualitative findings (split-K's win shape, the CUDA-vs-Triton gap)
+aren't laptop-specific artifacts. It does **not** include a
+re-tuned `num_splits` sweep, NCU profiling, or a FlashInfer comparison
+on A100 — each would be a reasonable next step, not done here by
+explicit choice, not an oversight.
