@@ -188,7 +188,7 @@ def main() -> None:
     ax.set_xlabel("operational intensity (FLOP/byte) -- series jittered around the true value for readability")
     ax.set_ylabel("achieved performance (GFLOP/s)")
     ax.set_title(
-        "Paged attention decode -- roofline (RTX 3060 Laptop, measured peaks)\n"
+        f"Paged attention decode -- roofline ({peak_bw['gpu_name']}, measured peaks)\n"
         "single-workload roofline: every point shares ~6 FLOP/byte intensity (fixed by GQA ratio) --\n"
         "only height vs. the bandwidth roof varies. Marker size = batch size (1..64, small to large)."
     )
