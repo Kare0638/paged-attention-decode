@@ -1229,3 +1229,31 @@ aren't laptop-specific artifacts. It does **not** include a
 re-tuned `num_splits` sweep, NCU profiling, or a FlashInfer comparison
 on A100 — each would be a reasonable next step, not done here by
 explicit choice, not an oversight.
+
+**NCU on this A100 pod: tried, confirmed structurally blocked, not a
+configuration problem.** `ncu` is installed (`/usr/local/cuda-12.8/bin/ncu`,
+just not on `PATH`), but profiling any kernel — verified with a
+throwaway `torch.matmul`, not even one of this project's own kernels —
+fails immediately:
+
+```
+==PROF== Connected to process 17664 (/usr/bin/python3.12)
+==ERROR== ERR_NVGPUCTRPERM - The user does not have permission to
+access NVIDIA GPU Performance Counters on the target device 0.
+==PROF== Disconnected from process 17664
+```
+
+This is the standard NVIDIA driver restriction
+(`NVreg_RestrictProfilingToAdminUsers=1`, the default since driver
+~418.43) that normally needs either a system administrator's fix on the
+host or the container launched with the `CAP_SYS_ADMIN` capability.
+Confirmed via independent reports (not just this one pod) that RunPod
+specifically does not support either path: their containers aren't
+privileged, exposing `--cap-add=SYS_ADMIN` to tenant containers would be
+a real security risk on shared GPU hardware, and `runpodctl`/the pod
+creation UI has no option to request privileged mode. This is a
+platform-level limitation, not something fixable from inside the pod —
+confirmed structurally blocked, not abandoned after a shallow attempt.
+Would need a different provider offering privileged containers or
+bare-metal instances to get NCU data on A100; not pursued further here
+by explicit choice.
