@@ -1,0 +1,33 @@
+{
+  "timestamp": "2026-08-07T05:19:13",
+  "measured_peak_bandwidth_gb_s": 1699.39,
+  "peak_at_buffer_mb": 1024,
+  "sweep": [
+    {
+      "buffer_mb": 64,
+      "bandwidth_gb_s": 1535.25
+    },
+    {
+      "buffer_mb": 128,
+      "bandwidth_gb_s": 1632.66
+    },
+    {
+      "buffer_mb": 256,
+      "bandwidth_gb_s": 1675.04
+    },
+    {
+      "buffer_mb": 512,
+      "bandwidth_gb_s": 1696.3
+    },
+    {
+      "buffer_mb": 1024,
+      "bandwidth_gb_s": 1699.39
+    }
+  ],
+  "gpu_name": "NVIDIA A100 80GB PCIe",
+  "driver_version": "580.159.04",
+  "power_draw_w": 275.33,
+  "power_limit_w": 300.0,
+  "sm_clock_mhz": 1410.0,
+  "method": "D2D torch.Tensor.copy_, best-of-50 via cuda.Event timing, bandwidth = 2*bytes/time (read+write)"
+}

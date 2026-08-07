@@ -4,7 +4,7 @@ Decode-phase attention kernel for LLM inference with paged KV cache and GQA supp
 
 ## Status
 
-Triton v1–v4 (naive, wider tiles, num_stages tuning, split-K) and CUDA C++ v1–v4 (naive baseline, batched shared-memory reduction, warp-shuffle reduction, split-K, all as `torch.utils.cpp_extension` extensions) are implemented, tested, and benchmarked — see Results below. This closes out the CUDA roadmap section. CUDA v4's split-K delivers the single largest win in the CUDA line (up to 20.64x vs. CUDA v3 at batch=1) but CUDA still trails Triton by roughly an order of magnitude in absolute terms — real, substantial progress across four versions (CUDA v1 was ~44x slower than Triton v1; CUDA v4 is ~2.8x slower than Triton v4), not a claim of parity, reported honestly in both directions. All roadmap items are now measured, including a FlashInfer comparison run on this project's own RTX 3060 Laptop rather than A100 (see Results below) — an A100 re-run remains a possible future addition, not promised here. This README gets updated with real benchmark numbers as each version ships — no numbers are reported until they're measured.
+Triton v1–v4 (naive, wider tiles, num_stages tuning, split-K) and CUDA C++ v1–v4 (naive baseline, batched shared-memory reduction, warp-shuffle reduction, split-K, all as `torch.utils.cpp_extension` extensions) are implemented, tested, and benchmarked — see Results below. This closes out the CUDA roadmap section. CUDA v4's split-K delivers the single largest win in the CUDA line (up to 20.64x vs. CUDA v3 at batch=1) but CUDA still trails Triton by roughly an order of magnitude in absolute terms — real, substantial progress across four versions (CUDA v1 was ~44x slower than Triton v1; CUDA v4 is ~2.8x slower than Triton v4), not a claim of parity, reported honestly in both directions. All roadmap items are now measured, including a FlashInfer comparison run on this project's own RTX 3060 Laptop rather than A100 (see Results below). A100 cross-hardware validation (test suite + benchmarks re-run on a rented A100 80GB, see Results below) confirms the same qualitative findings hold on real datacenter hardware, not just this project's small development GPU. This README gets updated with real benchmark numbers as each version ships — no numbers are reported until they're measured.
 
 ## Why this project
 
@@ -399,6 +399,14 @@ Full data in [profiles/notes.md](profiles/notes.md).
 
 FlashInfer wins at every batch size — expected, comparing a production-grade kernel library against two from-scratch learning implementations, and not the point of the exercise. Worth noting: the gap to Triton v4 (1.16x-2.07x) is far smaller than to CUDA v4 (6.17x-13.02x), the same pattern seen throughout this project — Triton's compiler-optimized codegen was always closer to competitive than the from-scratch CUDA line.
 
+**A100 cross-hardware validation** — optional follow-on: re-ran the full test suite and benchmarks on a rented A100 80GB PCIe (RunPod), in this project's own pinned environment, to check whether the laptop's findings generalize:
+
+- Full 302-test suite: 302 passed, 1 skipped (`flashinfer` not installed on this pod) in 485.72s on first run (includes JIT-compiling every CUDA extension for sm_80 from scratch) — confirms both languages' kernels compile and run correctly on different hardware with zero code changes.
+- Measured peaks: 1699.39 GB/s bandwidth (5.41x the laptop), 245.85 TFLOPS fp16 (9.30x the laptop), ridge point 144.67 FLOP/byte.
+- Two cross-hardware findings: `cuda_v4` vs. `cuda_v3` hits the *same* 20.64x at batch=1 on both GPUs, but persists much further into the batch sweep on A100 (3.04x at batch=64 vs. the laptop's 1.01x/parity) — plausibly because `num_splits=64`, tuned for the laptop's 28-SM occupancy profile, has more room before over-fragmenting on A100's ~108 SMs (a plausible mechanism, not independently isolated; `num_splits` was never re-swept for A100). `cuda_v4` vs. `Triton v4` — the honest CUDA-vs-Triton gap — has nearly the same *relative* shape on both GPUs (~2.5x-12.5x slower on A100 vs. ~2.8x-12.5x on the laptop), suggesting this gap reflects real implementation differences, not a small-GPU artifact.
+- Two real bugs only a genuinely fresh machine could surface, both fixed: `test_flashinfer_adapter.py`'s skip-when-`flashinfer`-absent path was silently broken by a pytest 9.1 default change (never caught locally since this project's own dev venv always had `flashinfer` installed); `bench/roofline.py`'s plot title had "RTX 3060 Laptop" hardcoded as a literal string.
+- Not done here, by explicit scope choice: a re-tuned `num_splits` sweep for A100, NCU profiling, or a FlashInfer comparison on A100. Full writeup, including a RunPod SSH-proxy connectivity gotcha worth knowing about, in [`profiles/notes.md`](profiles/notes.md#a100-cross-hardware-validation-2026-08-07).
+
 ## Repo layout
 
 ```
@@ -412,7 +420,7 @@ profiles/       Nsight Compute captures + notes
 
 ## Hardware
 
-RTX 3060 Laptop (6GB) on WSL2 for development; cross-hardware validation planned on A100.
+RTX 3060 Laptop (6GB) on WSL2 for development. Cross-hardware validation done on a rented A100 80GB PCIe (RunPod) — see Results above and [`profiles/notes.md`](profiles/notes.md#a100-cross-hardware-validation-2026-08-07); this project's own peak-bandwidth/compute measurements and full benchmark sweep were re-run there, not assumed to carry over.
 
 ## Reproduce
 

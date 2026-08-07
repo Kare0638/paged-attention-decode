@@ -1,0 +1,37 @@
+{
+  "timestamp": "2026-08-07T05:19:16",
+  "measured_peak_tflops_fp16": 245.85,
+  "peak_at_size": 4096,
+  "sweep": [
+    {
+      "m": 1024,
+      "n": 1024,
+      "k": 1024,
+      "tflops": 50.88
+    },
+    {
+      "m": 2048,
+      "n": 2048,
+      "k": 2048,
+      "tflops": 177.24
+    },
+    {
+      "m": 4096,
+      "n": 4096,
+      "k": 4096,
+      "tflops": 245.85
+    },
+    {
+      "m": 8192,
+      "n": 8192,
+      "k": 8192,
+      "tflops": 224.89
+    }
+  ],
+  "gpu_name": "NVIDIA A100 80GB PCIe",
+  "driver_version": "580.159.04",
+  "power_draw_w": 302.86,
+  "power_limit_w": 300.0,
+  "sm_clock_mhz": 1080.0,
+  "method": "torch.matmul fp16 square GEMM, best-of-30 via cuda.Event timing, FLOPs = 2*M*N*K. Not a speed-of-light microbenchmark."
+}
